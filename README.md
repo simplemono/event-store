@@ -5,8 +5,8 @@ A minimal append-only event log on S3-compatible object storage.
 One store is one stream. Everything it owns lives under one prefix:
 
 ```
-{prefix}/events/{inverted-19d}   one gzip-EDN object per event
-{prefix}/packs/{inverted-19d}    one gzip-EDN vector per :pack-size events
+{prefix}/events/{inverted-19d}              one gzip-EDN object per event
+{prefix}/packs/{pack-size}/{inverted-19d}   one gzip-EDN vector per :pack-size events
 ```
 
 Object names use an inverted key-space (`Long/MAX_VALUE - n`, zero-padded to 19
@@ -81,6 +81,12 @@ thousand events instead of one per event.
 
 Event objects are never deleted, so a pack that is missing, stale or corrupt
 only makes reads slower, never wrong.
+
+Packs are namespaced by their size. Changing `:pack-size` on an existing stream
+therefore starts a fresh set of packs and re-packs from event 0, instead of
+writing new-size packs at indices that already mean something else. The old
+packs are orphaned rather than corrupt: they are never read again, and
+`packs/{old-size}/` can be deleted whenever convenient.
 
 ## Events
 

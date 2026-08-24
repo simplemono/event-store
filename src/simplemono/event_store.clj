@@ -4,7 +4,8 @@
    One store is one stream. Everything it owns lives under one prefix:
 
      {prefix}/events/{inverted-19d}   one gzip-EDN object per event
-     {prefix}/packs/{inverted-19d}    one gzip-EDN vector per :pack-size events
+     {prefix}/packs/{pack-size}/{inverted-19d}
+                                      one gzip-EDN vector per :pack-size events
 
    Event numbers are zero-based and gap-free. `try-append!` is create-only:
    it returns true when the event was written and false when another writer
@@ -15,7 +16,10 @@
    Packing is an implementation detail. Completing a range starts a background
    thread that writes the packs, and `get-event` reads from a pack whenever one
    covers the number. Event objects are never deleted, so a pack that is
-   missing, stale or corrupt only makes reads slower, never wrong.
+   missing, stale or corrupt only makes reads slower, never wrong. Packs are
+   namespaced by their size, so changing :pack-size on an existing stream
+   orphans the old packs and re-packs from scratch rather than corrupting
+   them.
 
    Object names use an inverted key-space (Long/MAX_VALUE - n, zero-padded to
    19 digits), so the newest object sorts first and the head is one LIST with
@@ -78,9 +82,17 @@
   [prefix event-number]
   (str (sub-prefix prefix "events") (format-number event-number)))
 
+(defn- packs-prefix
+  "Packs are namespaced by their size. Changing :pack-size therefore starts a
+   fresh set of packs instead of writing new-size packs at indices that already
+   mean something else: the old packs are orphaned rather than corrupt, are
+   never read again, and can be removed with one prefix delete."
+  [prefix pack-size]
+  (str (sub-prefix prefix "packs") pack-size "/"))
+
 (defn- pack-key
-  [prefix pack-index]
-  (str (sub-prefix prefix "packs") (format-number pack-index)))
+  [prefix pack-size pack-index]
+  (str (packs-prefix prefix pack-size) (format-number pack-index)))
 
 (defn- key->number
   [prefix key]
@@ -203,8 +215,8 @@
   (newest-number store (sub-prefix prefix "events")))
 
 (defn- newest-pack-index
-  [{:keys [prefix] :as store}]
-  (newest-number store (sub-prefix prefix "packs")))
+  [{:keys [prefix pack-size] :as store}]
+  (newest-number store (packs-prefix prefix pack-size)))
 
 (defn- packed-through
   "The newest pack index this store knows about, or nil. Cached: event objects
@@ -223,7 +235,7 @@
   [{:keys [prefix pack-size state] :as store} pack-index]
   (or (when (= pack-index (:pack-index @state))
         (:pack @state))
-      (let [events (get-edn store (pack-key prefix pack-index))]
+      (let [events (get-edn store (pack-key prefix pack-size pack-index))]
         (when (and (vector? events)
                    (= pack-size (count events)))
           (swap! state assoc :pack-index pack-index :pack events)
@@ -255,7 +267,7 @@
                                             :event-number n
                                             :pack-index pack-index}))))
                      (range from (+ from pack-size)))]
-    (put! store (pack-key prefix pack-index) (gzip-bytes (pr-str events)))))
+    (put! store (pack-key prefix pack-size pack-index) (gzip-bytes (pr-str events)))))
 
 (defn- pack-completed-ranges!
   "Write every full pack that does not exist yet, oldest first. Packs are

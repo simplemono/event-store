@@ -92,10 +92,10 @@
     (is (empty? (filter #(str/starts-with? % "org/acme/packs/") (keys @objects)))
         "a partial range is not packed")
     (event-store/try-append! s 3 (event 3))
-    (is (= ["org/acme/packs/9223372036854775807"]
+    (is (= ["org/acme/packs/4/9223372036854775807"]
            (filter #(str/starts-with? % "org/acme/packs/") (keys @objects))))
     (is (= (pr-str (mapv event (range 4)))
-           (gunzip (get @objects "org/acme/packs/9223372036854775807"))))
+           (gunzip (get @objects "org/acme/packs/4/9223372036854775807"))))
     (testing "the tail beyond the pack still reads from its own object"
       (event-store/try-append! s 4 (event 4))
       (is (= (event 4) (event-store/get-event s 4))))
@@ -117,9 +117,9 @@
     (is (empty? (filter #(str/starts-with? % "org/acme/packs/") (keys @objects))))
     (let [s (store objects {:pack-size 4})]
       (event-store/try-append! s 11 (event 11))
-      (is (= ["org/acme/packs/9223372036854775805"
-              "org/acme/packs/9223372036854775806"
-              "org/acme/packs/9223372036854775807"]
+      (is (= ["org/acme/packs/4/9223372036854775805"
+              "org/acme/packs/4/9223372036854775806"
+              "org/acme/packs/4/9223372036854775807"]
              (filter #(str/starts-with? % "org/acme/packs/") (keys @objects)))
           "one boundary packs every full range below the head, oldest first"))))
 
@@ -128,11 +128,32 @@
         s (store objects {:pack-size 4})]
     (append-range! s 0 8)
     (is (= 2 (count (filter #(str/starts-with? % "org/acme/packs/") (keys @objects)))))
-    (swap! objects dissoc "org/acme/packs/9223372036854775807")
+    (swap! objects dissoc "org/acme/packs/4/9223372036854775807")
     (testing "a fresh store falls back to the individual event objects"
       (let [reader (store objects {:pack-size 4})]
         (is (= (mapv event (range 8))
                (mapv #(event-store/get-event reader %) (range 8))))))))
+
+(deftest changing-the-pack-size-orphans-the-old-packs
+  (let [objects (objects)
+        small (store objects {:pack-size 4})]
+    (append-range! small 0 8)
+    (is (= 2 (count (filter #(str/starts-with? % "org/acme/packs/4/") (keys @objects)))))
+    (testing "a store with another size packs into its own namespace"
+      (let [large (store objects {:pack-size 8})]
+        (append-range! large 8 16)
+        (is (= ["org/acme/packs/8/9223372036854775806"
+                "org/acme/packs/8/9223372036854775807"]
+               (filter #(str/starts-with? % "org/acme/packs/8/") (keys @objects)))
+            "packing keeps working, and re-packs from event 0 under the new size")
+        (is (= 2 (count (filter #(str/starts-with? % "org/acme/packs/4/") (keys @objects))))
+            "the old packs are untouched, just orphaned")
+        (testing "and every event still reads correctly under either size"
+          (is (= (mapv event (range 16))
+                 (mapv #(event-store/get-event large %) (range 16))))
+          (is (= (mapv event (range 16))
+                 (mapv #(event-store/get-event (store objects {:pack-size 4}) %)
+                       (range 16)))))))))
 
 (defn- flaky-put-client
   "Delegates everything to a memory client, but every putObject throws the way
@@ -189,7 +210,7 @@
       (while (and (empty? (filter #(str/starts-with? % "org/acme/packs/") (keys @objects)))
                   (< (System/currentTimeMillis) deadline))
         (Thread/sleep 10)))
-    (is (= ["org/acme/packs/9223372036854775807"]
+    (is (= ["org/acme/packs/4/9223372036854775807"]
            (filter #(str/starts-with? % "org/acme/packs/") (keys @objects))))))
 
 (deftest a-blank-prefix-puts-events-at-the-bucket-root
