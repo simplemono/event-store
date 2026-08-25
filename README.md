@@ -18,11 +18,12 @@ digits), so the newest object sorts first and finding the head is one LIST with
 | module | namespace | depends on |
 | --- | --- | --- |
 | `core` | `simplemono.event-store` — the `EventStore` protocol | nothing |
-| `s3` | `simplemono.event-store.s3` — the S3 implementation, and `…/memory-client` for tests | `core`, `awssdk/s3` |
+| `s3` | `simplemono.event-store.s3` — the S3 implementation | `core`, `awssdk/s3` |
+| `memory` | `simplemono.event-store.memory` — an in-memory implementation | `core` |
 
 The protocol namespace has no dependencies of its own, so a future file-,
 SQLite- or whatever-backed implementation can satisfy it without pulling in the
-AWS SDK.
+AWS SDK — `memory` is the worked example.
 
 ```clojure
 simplemono/event-store-s3 {:git/url "https://github.com/simplemono/event-store.git"
@@ -187,26 +188,38 @@ log.
 | `:on-pack-error` | prints to `*err*` | called with the Throwable when background packing fails |
 | `:on-retry` | prints to `*err*` | called with `{:op :key :attempt :exception}` before each retry |
 
-## Testing
+## Testing your own code
 
-`simplemono.event-store.memory-client/client` is an in-memory `S3Client`. It is
-a fake transport rather than a second storage backend, so a test exercises the
-real code: the same key encoding, the same inverted ordering, the same gzip,
-the same create-only put and the same packing. Only the network is missing.
+Depend on `memory` and build a store that needs no network:
 
 ```clojure
-(require '[simplemono.event-store.memory-client :as memory-client])
+(require '[simplemono.event-store :as event-store]
+         '[simplemono.event-store.memory :as memory])
 
-(s3/store {:client (memory-client/client)
-           :bucket "events"
-           :prefix "org/acme"
-           :pack-size 4
-           :pack-async? false})
+(def store (memory/store))
+
+(event-store/try-append! store 0 {:event/type :example/happened})
 ```
 
-Pass your own atom to `client` to inspect the stored objects.
+Pass your own atom over a sorted map to `memory/store` to seed a stream or to
+inspect one. Appends are serialised, so concurrent writers see the same
+create-only, gap-free behaviour an object store gives them. What it cannot
+reproduce is a network: there is no retrying and no uncertain write, because
+an append here either happened or threw.
 
-Run the tests with `cd s3 && clojure -M:test`.
+## Testing this library
+
+Each module runs its own suite:
+
+```
+cd core   && clojure -M:test   # nothing to run — the protocol has no code
+cd memory && clojure -M:test
+cd s3     && clojure -M:test
+```
+
+The `s3` suite runs against an in-memory `S3Client` living in its test path,
+so it exercises the real code — the same key encoding, inverted ordering,
+gzip, create-only put, retrying and packing — with only the network missing.
 
 ## License
 
