@@ -50,6 +50,45 @@
     (is (= (dec writers) (count (filter false? results))))
     (is (= 0 (event-store/latest-event-number s)))))
 
+(deftest replaying-reads-every-event-in-order
+  (let [s (memory/store)]
+    (dotimes [n 5]
+      (event-store/try-append! s n (event n)))
+    (is (= (mapv event (range 5))
+           (event-store/reduce-events s 0 conj [])))
+    (testing "a replay can start anywhere"
+      (is (= (mapv event (range 3 5))
+             (event-store/reduce-events s 3 conj []))))
+    (testing "it stops at the first number that does not exist"
+      (is (= [] (event-store/reduce-events s 5 conj []))))
+    (testing "reduced stops early"
+      (is (= (mapv event (range 2))
+             (event-store/reduce-events s 0
+                                        (fn [acc e]
+                                          (if (= 2 (count acc))
+                                            (reduced acc)
+                                            (conj acc e)))
+                                        []))))))
+
+(deftest an-empty-stream-replays-to-init
+  (is (= :nothing (event-store/reduce-events (memory/store) 0 conj :nothing))))
+
+(deftest a-store-with-its-own-bulk-read-is-used-instead-of-the-fallback
+  (let [called (atom 0)
+        accelerated (reify
+                      event-store/EventStore
+                      (try-append! [_ _ _] true)
+                      (get-event [_ _] (throw (AssertionError. "should not be reached")))
+                      (latest-event-number [_] 1)
+
+                      event-store/EventReplay
+                      (-reduce-events [_ from f init]
+                        (swap! called inc)
+                        (reduce f init (map event (range from 2)))))]
+    (is (= (mapv event (range 2))
+           (event-store/reduce-events accelerated 0 conj [])))
+    (is (= 1 @called))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'simplemono.event-store.memory-test)]
     (when (pos? (+ fail error))
