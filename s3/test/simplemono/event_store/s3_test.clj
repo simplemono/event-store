@@ -1,8 +1,9 @@
-(ns simplemono.event-store-test
+(ns simplemono.event-store.s3-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is run-tests testing]]
             [simplemono.event-store :as event-store]
-            [simplemono.event-store.memory-client :as memory-client])
+            [simplemono.event-store.memory-client :as memory-client]
+            [simplemono.event-store.s3 :as s3])
   (:import (java.io ByteArrayInputStream)
            (java.util.zip GZIPInputStream)
            (software.amazon.awssdk.core ResponseInputStream)
@@ -33,7 +34,7 @@
 (defn- store
   ([objects] (store objects {}))
   ([objects overrides]
-   (event-store/store
+   (s3/store
     (merge {:client (memory-client/client objects)
             :bucket "events"
             :prefix "org/acme"
@@ -178,7 +179,7 @@
 (deftest an-ambiguous-put-is-decided-by-the-stored-object
   (testing "our own event under the key means the put landed"
     (let [objs (objects)
-          s (event-store/store {:client (flaky-put-client objs true)
+          s (s3/store {:client (flaky-put-client objs true)
                                 :bucket "events"
                                 :prefix "org/acme"
                                 :pack-async? false})]
@@ -187,14 +188,14 @@
     (let [objs (objects)
           seeded (store objs)]
       (is (true? (event-store/try-append! seeded 0 (event 0))))
-      (let [s (event-store/store {:client (flaky-put-client objs false)
+      (let [s (s3/store {:client (flaky-put-client objs false)
                                   :bucket "events"
                                   :prefix "org/acme"
                                   :pack-async? false})]
         (is (false? (event-store/try-append! s 0 (event 99)))))))
   (testing "no object at all leaves the outcome genuinely unknown"
     (let [objs (objects)
-          s (event-store/store {:client (flaky-put-client objs false)
+          s (s3/store {:client (flaky-put-client objs false)
                                 :bucket "events"
                                 :prefix "org/acme"
                                 :pack-async? false})]
@@ -220,6 +221,6 @@
     (is (= ["events/9223372036854775807"] (keys @objects)))))
 
 (defn -main [& _]
-  (let [{:keys [fail error]} (run-tests 'simplemono.event-store-test)]
+  (let [{:keys [fail error]} (run-tests 'simplemono.event-store.s3-test)]
     (when (pos? (+ fail error))
       (System/exit 1))))

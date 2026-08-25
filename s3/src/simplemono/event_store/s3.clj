@@ -1,5 +1,5 @@
-(ns simplemono.event-store
-  "Append-only event log on S3-compatible object storage.
+(ns simplemono.event-store.s3
+  "`simplemono.event-store/EventStore` on S3-compatible object storage.
 
    One store is one stream. Everything it owns lives under one prefix:
 
@@ -29,7 +29,8 @@
    of them end up in one pack object. Keep large payloads in a blob store and
    put the blob's name in the event."
   (:require [clojure.edn :as edn]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [simplemono.event-store :as event-store])
   (:import (java.io ByteArrayOutputStream)
            (java.net URI)
            (java.nio.charset StandardCharsets)
@@ -209,7 +210,7 @@
                    :event-number event-number}
                   cause)))
 
-(defn latest-event-number
+(defn- head
   "The highest event number in the stream, or nil when the stream is empty."
   [{:keys [prefix] :as store}]
   (newest-number store (sub-prefix prefix "events")))
@@ -245,7 +246,7 @@
   [{:keys [prefix] :as store} event-number]
   (get-edn store (event-key prefix event-number)))
 
-(defn get-event
+(defn- read-event
   "The event at `event-number`, or nil when it does not exist. Served from a
    pack when one covers the number, otherwise from the individual object."
   [{:keys [pack-size] :as store} event-number]
@@ -274,8 +275,8 @@
    written in ascending order and creation is create-only, so concurrent
    packers are safe and an interrupted run resumes where it stopped."
   [{:keys [pack-size state] :as store}]
-  (when-some [head (latest-event-number store)]
-    (let [full-packs (quot (inc (long head)) pack-size)
+  (when-some [latest (head store)]
+    (let [full-packs (quot (inc (long latest)) pack-size)
           start (if-some [through (newest-pack-index store)]
                   (inc through)
                   0)]
@@ -308,12 +309,8 @@
       (= stored event) true
       :else false)))
 
-(defn try-append!
+(defn- append!
   "Create-only append of `event` at `event-number`.
-
-   Returns true when the event was written and false when another writer
-   already took that number. Throws {:error :gap} when the previous event is
-   missing and {:error :ambiguous} when the outcome could not be determined.
 
    Checks the previous event with HEAD rather than listing the stream: LIST is
    a Class A operation on object stores such as Tigris while HEAD is Class B,
@@ -342,6 +339,18 @@
   (binding [*out* *err*]
     (println "simplemono.event-store: packing failed:" (.getMessage t))
     (.printStackTrace t)))
+
+(defrecord S3EventStore [client bucket prefix headers
+                        pack-size pack? pack-async? on-pack-error state]
+  event-store/EventStore
+  (try-append! [this event-number event]
+    (append! this event-number event))
+
+  (get-event [this event-number]
+    (read-event this event-number))
+
+  (latest-event-number [this]
+    (head this)))
 
 (defn client
   "An AWS SDK S3 client for an S3-compatible object store.
@@ -402,15 +411,15 @@
     (throw (ex-info ":pack-size must be a positive integer"
                     {:error :incorrect
                      :pack-size pack-size})))
-  {:client client
-   :bucket bucket
-   :prefix (normalize-prefix prefix)
-   :headers (or headers {})
-   :pack-size pack-size
-   :pack? pack?
-   :pack-async? pack-async?
-   :on-pack-error (or on-pack-error print-pack-error)
-   :state (atom {})})
+  (->S3EventStore client
+                  bucket
+                  (normalize-prefix prefix)
+                  (or headers {})
+                  pack-size
+                  pack?
+                  pack-async?
+                  (or on-pack-error print-pack-error)
+                  (atom {})))
 
 (comment
 
@@ -422,18 +431,18 @@
                  :pack-size 4
                  :pack-async? false}))
 
-  (latest-event-number s)
+  (event-store/latest-event-number s)
 
-  (try-append! s 0 {:event/type :example/created})
-  (try-append! s 0 {:event/type :example/created})
+  (event-store/try-append! s 0 {:event/type :example/created})
+  (event-store/try-append! s 0 {:event/type :example/created})
 
-  (get-event s 0)
+  (event-store/get-event s 0)
 
   ;; Append until the first pack is complete, then read through it:
   (doseq [n (range 1 8)]
-    (try-append! s n {:event/type :example/updated :n n}))
+    (event-store/try-append! s n {:event/type :example/updated :n n}))
 
-  (latest-event-number s)
-  (get-event s 3)
+  (event-store/latest-event-number s)
+  (event-store/get-event s 3)
 
   )

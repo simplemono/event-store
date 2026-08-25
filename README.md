@@ -13,17 +13,38 @@ Object names use an inverted key-space (`Long/MAX_VALUE - n`, zero-padded to 19
 digits), so the newest object sorts first and finding the head is one LIST with
 `maxKeys=1`.
 
+## Modules
+
+| module | namespace | depends on |
+| --- | --- | --- |
+| `core` | `simplemono.event-store` — the `EventStore` protocol | nothing |
+| `s3` | `simplemono.event-store.s3` — the S3 implementation, and `…/memory-client` for tests | `core`, `awssdk/s3` |
+
+The protocol namespace has no dependencies of its own, so a future file-,
+SQLite- or whatever-backed implementation can satisfy it without pulling in the
+AWS SDK.
+
+```clojure
+simplemono/event-store-s3 {:git/url "https://github.com/simplemono/event-store.git"
+                           :sha "…"
+                           :deps/root "s3"}
+```
+
+`core` comes along with it; depend on `:deps/root "core"` alone when you only
+need the protocol.
+
 ## Usage
 
 ```clojure
-(require '[simplemono.event-store :as event-store])
+(require '[simplemono.event-store :as event-store]
+         '[simplemono.event-store.s3 :as s3])
 
 (def store
-  (event-store/store
-   {:client (event-store/client {:endpoint "https://t3.storage.dev"
-                                 :region "auto"
-                                 :access-key-id "…"
-                                 :secret-access-key "…"})
+  (s3/store
+   {:client (s3/client {:endpoint "https://t3.storage.dev"
+                        :region "auto"
+                        :access-key-id "…"
+                        :secret-access-key "…"})
     :bucket "events"
     :prefix "org/acme"
     :headers {"X-Tigris-Consistent" "true"}}))
@@ -38,7 +59,8 @@ digits), so the newest object sorts first and finding the head is one LIST with
 ;; => 0
 ```
 
-That is the whole API, plus `client` for building an `S3Client`.
+Those three are the whole protocol. `s3/store` builds an implementation of it
+and `s3/client` builds an `S3Client`.
 
 ## Appending
 
@@ -139,7 +161,7 @@ log.
 
 ## Options
 
-`store` requires `:client`, `:bucket` and `:prefix`, and accepts:
+`s3/store` requires `:client`, `:bucket` and `:prefix`, and accepts:
 
 | option | default | meaning |
 | --- | --- | --- |
@@ -159,16 +181,16 @@ the same create-only put and the same packing. Only the network is missing.
 ```clojure
 (require '[simplemono.event-store.memory-client :as memory-client])
 
-(event-store/store {:client (memory-client/client)
-                    :bucket "events"
-                    :prefix "org/acme"
-                    :pack-size 4
-                    :pack-async? false})
+(s3/store {:client (memory-client/client)
+           :bucket "events"
+           :prefix "org/acme"
+           :pack-size 4
+           :pack-async? false})
 ```
 
 Pass your own atom to `client` to inspect the stored objects.
 
-Run the tests with `clojure -M:test`.
+Run the tests with `cd s3 && clojure -M:test`.
 
 ## License
 
