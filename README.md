@@ -67,7 +67,7 @@ and `s3/client` builds an `S3Client`.
 Event numbers are zero-based and gap-free. `try-append!` is create-only: it
 returns `true` when the event was written and `false` when another writer
 already took that number. It throws `{:error :gap}` when the previous event is
-missing and `{:error :ambiguous}` when the outcome could not be determined.
+missing and `{:error :incorrect}` when the number is not a valid one.
 
 The caller chooses the number, which is normally its read-model cursor plus
 one. A `false` therefore means the state the caller decided on has moved, and
@@ -89,10 +89,25 @@ An append is one HEAD plus one PUT. The previous event is checked with HEAD
 rather than by listing the stream, because LIST is a Class A operation on
 object stores such as Tigris while HEAD is Class B — roughly ten times cheaper.
 
-An ambiguous PUT is resolved by reading the object back: our own event means
-the put landed, a different event means another writer won, nothing at all
-means the outcome is genuinely unknown. No event field is required for this, so
-the library stays agnostic about event shape.
+## Failure
+
+A transient failure never reaches the caller. Every request is retried, with
+exponential backoff and jitter, until the object store answers: a client-side
+exception, a 429 or a 5xx means try again. A 4xx means the request itself is
+wrong and is thrown at once, so a bad key or a missing bucket fails loudly
+rather than hanging forever. The loop sleeps between attempts, so interrupting
+the thread ends it, and `:on-retry` is called before each attempt — replace it
+with your own logging, or an outage is indistinguishable from slowness.
+
+Retrying an append is safe because the put is create-only. What a retry cannot
+see by itself is whether the attempt that failed had in fact landed: a later
+attempt then finds the key taken and cannot tell our own write from somebody
+else's. Reading the object back settles it — an equal value was ours.
+
+That is why events must round-trip unchanged, and it is the reason there is no
+"the outcome is unknown" result. Resolving an uncertain write is the
+implementation's job, because only the implementation knows what it wrote and
+where. A `false` from `try-append!` always means somebody else won.
 
 ## Packing
 
@@ -170,6 +185,7 @@ log.
 | `:pack?` | `true` | set false to never pack |
 | `:pack-async?` | `true` | set false to pack on the appending thread |
 | `:on-pack-error` | prints to `*err*` | called with the Throwable when background packing fails |
+| `:on-retry` | prints to `*err*` | called with `{:op :key :attempt :exception}` before each retry |
 
 ## Testing
 

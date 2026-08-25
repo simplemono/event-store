@@ -27,12 +27,15 @@
        :incorrect  `event-number` is not a valid event number
        :gap        appending here would leave a hole, because the previous
                    event does not exist
-       :ambiguous  the append may or may not have landed and the
-                   implementation could not determine which
+
+     Beyond those, an implementation may throw whatever its storage throws when
+     the storage itself is misconfigured or broken. It may not, however, hand
+     the caller an append whose outcome is unknown: resolving that is the
+     implementation's job, because only it knows what it wrote and where.
 
      An event must be a value the implementation can store and read back
-     unchanged; equality of the round trip is what makes :ambiguous
-     resolvable.")
+     unchanged, which is what lets an implementation settle an uncertain write
+     by comparing what is stored with what it meant to store.")
 
   (get-event [store event-number]
     "The event at `event-number`, or nil when it does not exist.")

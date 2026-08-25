@@ -13,6 +13,20 @@
    its read-model cursor plus one, so a lost append means the state the caller
    decided on has moved and it should catch up and decide again.
 
+   Transient failures never reach the caller. Every request is retried, with
+   backoff, until the object store answers: a client-side exception, a 429 or a
+   5xx means try again, while a 4xx means the request itself is wrong and is
+   thrown at once, so a bad key or a missing bucket fails loudly instead of
+   hanging forever. Retries are announced through :on-retry, and the loop
+   sleeps, so interrupting the thread ends it.
+
+   Retrying an append is safe because the put is create-only. What a retry
+   cannot see by itself is whether the attempt that failed had in fact landed:
+   a later attempt then finds the key taken and cannot tell our own write from
+   somebody else's. Reading the object back settles it — an equal value was
+   ours. That is why events must be EDN round-trippable, and why the caller
+   never has to reason about an ambiguous append.
+
    Packing is an implementation detail. Completing a range starts a background
    thread that writes the packs, and `get-event` reads from a pack whenever one
    covers the number. Event objects are never deleted, so a pack that is
@@ -25,9 +39,8 @@
    19 digits), so the newest object sorts first and the head is one LIST with
    maxKeys=1.
 
-   Events must be EDN round-trippable values and should stay small: :pack-size
-   of them end up in one pack object. Keep large payloads in a blob store and
-   put the blob's name in the event."
+   Events should stay small: :pack-size of them end up in one pack object.
+   Keep large payloads in a blob store and put the blob's name in the event."
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [simplemono.event-store :as event-store])
@@ -117,6 +130,52 @@
   [^S3Exception e]
   (= 404 (.statusCode e)))
 
+(defn- transient-failure?
+  "True when the object store may answer differently next time. A client-side
+   exception is a network or timeout problem, 429 is throttling and 5xx is the
+   store's own trouble. Everything else — a bad key, a missing bucket, a
+   malformed request — is the caller's problem and must not be retried, or a
+   configuration error turns into a silent hang."
+  [t]
+  (or (instance? SdkClientException t)
+      (and (instance? S3Exception t)
+           (let [status (.statusCode ^S3Exception t)]
+             (or (= 429 status)
+                 (<= 500 status))))))
+
+(defn- retry-delay-ms
+  "Exponential backoff from 100ms, capped at 30s, with jitter so that writers
+   which failed together do not come back in lockstep."
+  [attempt]
+  (+ (rand-int 100)
+     (min 30000 (* 100 (bit-shift-left 1 (min (long attempt) 8))))))
+
+(defn- await-retry!
+  "Announce the failed attempt, then sleep before the next one. Sleeping is
+   what makes the loop interruptible: interrupting the thread ends it."
+  [{:keys [on-retry]} op key attempt ^Throwable t]
+  (on-retry {:op op
+             :key key
+             :attempt attempt
+             :exception t})
+  (Thread/sleep (retry-delay-ms (dec (long attempt)))))
+
+(defn- with-retry
+  "Call `thunk` until the object store answers, retrying transient failures."
+  [store op key thunk]
+  (loop [attempt 1]
+    (let [outcome (try
+                    {:value (thunk)}
+                    (catch Throwable t
+                      (if (transient-failure? t)
+                        {:failure t}
+                        (throw t))))]
+      (if-some [t (:failure outcome)]
+        (do
+          (await-retry! store op key attempt t)
+          (recur (inc attempt)))
+        (:value outcome)))))
+
 (defn- override
   [headers create-only?]
   (reify Consumer
@@ -126,9 +185,30 @@
       (when create-only?
         (.putHeader builder "If-None-Match" "*")))))
 
-(defn- put!
-  "Create-only put of `bytes` at `key`. Returns true when created, false when
-   the key already existed."
+(defn- get-edn
+  "The gzip-EDN value at `key`, or nil when the object does not exist."
+  [{:keys [^S3Client client bucket headers] :as store} key]
+  (try
+    (with-retry
+      store :get key
+      (fn []
+        (with-open [in (.getObject client
+                                   (-> (GetObjectRequest/builder)
+                                       (.bucket bucket)
+                                       (.key key)
+                                       (.overrideConfiguration (override headers false))
+                                       (.build)))
+                    gzip (GZIPInputStream. in)]
+          (edn/read-string (slurp gzip :encoding "UTF-8")))))
+    (catch NoSuchKeyException _
+      nil)
+    (catch S3Exception e
+      (if (not-found? e)
+        nil
+        (throw e)))))
+
+(defn- put-once!
+  "One create-only put. True when created, false when the key already existed."
   [{:keys [^S3Client client bucket headers]} key bytes]
   (try
     (.putObject client
@@ -146,35 +226,45 @@
         false
         (throw e)))))
 
-(defn- get-edn
-  "The gzip-EDN value at `key`, or nil when the object does not exist."
-  [{:keys [^S3Client client bucket headers]} key]
-  (try
-    (with-open [in (.getObject client
-                               (-> (GetObjectRequest/builder)
-                                   (.bucket bucket)
-                                   (.key key)
-                                   (.overrideConfiguration (override headers false))
-                                   (.build)))
-                gzip (GZIPInputStream. in)]
-      (edn/read-string (slurp gzip :encoding "UTF-8")))
-    (catch NoSuchKeyException _
-      nil)
-    (catch S3Exception e
-      (if (not-found? e)
-        nil
-        (throw e)))))
+(defn- put!
+  "Create-only put of `bytes` at `key`, retrying until the object store
+   answers. True when this store created the object, false when it already
+   existed.
+
+   An attempt that failed transiently may still have landed. When a later
+   attempt then finds the key taken, `value` decides whose write it was: an
+   equal stored value was ours."
+  [store key bytes value]
+  (loop [attempt 1
+         uncertain? false]
+    (let [outcome (try
+                    {:created? (put-once! store key bytes)}
+                    (catch Throwable t
+                      (if (transient-failure? t)
+                        {:failure t}
+                        (throw t))))]
+      (if-some [t (:failure outcome)]
+        (do
+          (await-retry! store :put key attempt t)
+          (recur (inc attempt) true))
+        (let [created? (:created? outcome)]
+          (if (and (false? created?) uncertain?)
+            (= value (get-edn store key))
+            created?))))))
 
 (defn- object-exists?
-  [{:keys [^S3Client client bucket headers]} key]
+  [{:keys [^S3Client client bucket headers] :as store} key]
   (try
-    (.headObject client
-                 (-> (HeadObjectRequest/builder)
-                     (.bucket bucket)
-                     (.key key)
-                     (.overrideConfiguration (override headers false))
-                     (.build)))
-    true
+    (with-retry
+      store :head key
+      (fn []
+        (.headObject client
+                     (-> (HeadObjectRequest/builder)
+                         (.bucket bucket)
+                         (.key key)
+                         (.overrideConfiguration (override headers false))
+                         (.build)))
+        true))
     (catch NoSuchKeyException _
       false)
     (catch S3Exception e
@@ -185,30 +275,26 @@
 (defn- newest-number
   "The highest number under `prefix`, or nil when the prefix is empty. One LIST
    with maxKeys=1: the inverted key-space sorts the newest object first."
-  [{:keys [^S3Client client bucket headers]} prefix]
-  (let [^ListObjectsV2Response response
-        (.listObjectsV2 client
-                        (-> (ListObjectsV2Request/builder)
-                            (.bucket bucket)
-                            (.prefix prefix)
-                            (.maxKeys (int 1))
-                            (.overrideConfiguration (override headers false))
-                            (.build)))]
-    (when-let [object (first (.contents response))]
-      (key->number prefix (.key ^S3Object object)))))
+  [{:keys [^S3Client client bucket headers] :as store} prefix]
+  (with-retry
+    store :list prefix
+    (fn []
+      (let [^ListObjectsV2Response response
+            (.listObjectsV2 client
+                            (-> (ListObjectsV2Request/builder)
+                                (.bucket bucket)
+                                (.prefix prefix)
+                                (.maxKeys (int 1))
+                                (.overrideConfiguration (override headers false))
+                                (.build)))]
+        (when-let [object (first (.contents response))]
+          (key->number prefix (.key ^S3Object object)))))))
 
 (defn- gap!
   [event-number]
   (throw (ex-info "Append would create a gap"
                   {:error :gap
                    :event-number event-number})))
-
-(defn- ambiguous!
-  [event-number cause]
-  (throw (ex-info "Append outcome ambiguous"
-                  {:error :ambiguous
-                   :event-number event-number}
-                  cause)))
 
 (defn- head
   "The highest event number in the stream, or nil when the stream is empty."
@@ -268,7 +354,10 @@
                                             :event-number n
                                             :pack-index pack-index}))))
                      (range from (+ from pack-size)))]
-    (put! store (pack-key prefix pack-size pack-index) (gzip-bytes (pr-str events)))))
+    (put! store
+          (pack-key prefix pack-size pack-index)
+          (gzip-bytes (pr-str events))
+          events)))
 
 (defn- pack-completed-ranges!
   "Write every full pack that does not exist yet, oldest first. Packs are
@@ -298,17 +387,6 @@
       (run))
     nil))
 
-(defn- disambiguate!
-  "The put gave no definitive answer. The object decides: our own event means
-   the put landed, a different event means another writer won, and nothing at
-   all leaves the outcome genuinely unknown."
-  [store event-number event cause]
-  (let [stored (event-object store event-number)]
-    (cond
-      (nil? stored) (ambiguous! event-number cause)
-      (= stored event) true
-      :else false)))
-
 (defn- append!
   "Create-only append of `event` at `event-number`.
 
@@ -323,10 +401,10 @@
                        :event-number event-number})))
     (if (or (zero? event-number)
             (object-exists? store (event-key prefix (dec event-number))))
-      (let [appended (try
-                       (put! store (event-key prefix event-number) (gzip-bytes (pr-str event)))
-                       (catch SdkClientException e
-                         (disambiguate! store event-number event e)))]
+      (let [appended (put! store
+                           (event-key prefix event-number)
+                           (gzip-bytes (pr-str event))
+                           event)]
         (when (and appended
                    pack?
                    (zero? (mod (inc event-number) pack-size)))
@@ -334,14 +412,22 @@
         appended)
       (gap! event-number))))
 
+(defn- print-retry
+  [{:keys [op key attempt ^Throwable exception]}]
+  (binding [*out* *err*]
+    (println (str "simplemono.event-store.s3: " (name op) " " key
+                  " failed (attempt " attempt "), retrying: "
+                  (.getMessage exception)))))
+
 (defn- print-pack-error
   [^Throwable t]
   (binding [*out* *err*]
-    (println "simplemono.event-store: packing failed:" (.getMessage t))
+    (println "simplemono.event-store.s3: packing failed:" (.getMessage t))
     (.printStackTrace t)))
 
 (defrecord S3EventStore [client bucket prefix headers
-                        pack-size pack? pack-async? on-pack-error state]
+                         pack-size pack? pack-async? on-pack-error on-retry
+                         state]
   event-store/EventStore
   (try-append! [this event-number event]
     (append! this event-number event))
@@ -398,8 +484,13 @@
    - :pack?          set false to never pack, default true
    - :pack-async?    set false to pack on the appending thread, default true
    - :on-pack-error  called with the Throwable when background packing fails,
-                     defaults to printing it to *err*"
-  [{:keys [client bucket prefix headers pack-size pack? pack-async? on-pack-error]
+                     defaults to printing it to *err*
+   - :on-retry       called with {:op :key :attempt :exception} before every
+                     retry of a transient failure, defaults to printing a line
+                     to *err*. An outage is otherwise indistinguishable from
+                     slowness, so replace this with your own logging."
+  [{:keys [client bucket prefix headers pack-size pack? pack-async?
+           on-pack-error on-retry]
     :or {pack-size 1000
          pack? true
          pack-async? true}}]
@@ -419,6 +510,7 @@
                   pack?
                   pack-async?
                   (or on-pack-error print-pack-error)
+                  (or on-retry print-retry)
                   (atom {})))
 
 (comment

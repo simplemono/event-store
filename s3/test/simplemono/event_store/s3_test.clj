@@ -16,7 +16,8 @@
                                                      ListObjectsV2Request
                                                      ListObjectsV2Response
                                                      PutObjectRequest
-                                                     PutObjectResponse)))
+                                                     PutObjectResponse
+                                                     S3Exception)))
 
 (defn- event
   [n]
@@ -156,16 +157,22 @@
                  (mapv #(event-store/get-event (store objects {:pack-size 4}) %)
                        (range 16)))))))))
 
-(defn- flaky-put-client
-  "Delegates everything to a memory client, but every putObject throws the way
-   a connection reset does — after storing the object or without storing it."
-  [objects store-it?]
-  (let [^S3Client delegate (memory-client/client objects)]
+(defn- failing-put-client
+  "Delegates to a memory client, but the first `failures` putObject calls throw
+   the way a connection reset does — after storing the object or without
+   storing it, so both sides of an uncertain write can be exercised."
+  [objects failures store-it?]
+  (let [^S3Client delegate (memory-client/client objects)
+        remaining (atom failures)]
     (reify S3Client
       (^PutObjectResponse putObject [_ ^PutObjectRequest request ^RequestBody body]
-        (when store-it?
-          (.putObject delegate request body))
-        (throw (SdkClientException/create "Connection reset")))
+        (if (pos? @remaining)
+          (do
+            (swap! remaining dec)
+            (when store-it?
+              (.putObject delegate request body))
+            (throw (SdkClientException/create "Connection reset")))
+          (.putObject delegate request body)))
 
       (^ResponseInputStream getObject [_ ^GetObjectRequest request]
         (.getObject delegate request))
@@ -176,32 +183,57 @@
       (^ListObjectsV2Response listObjectsV2 [_ ^ListObjectsV2Request request]
         (.listObjectsV2 delegate request)))))
 
-(deftest an-ambiguous-put-is-decided-by-the-stored-object
-  (testing "our own event under the key means the put landed"
+(deftest transient-failures-are-retried-until-the-store-answers
+  (testing "a put that fails twice and then succeeds still appends"
     (let [objs (objects)
-          s (s3/store {:client (flaky-put-client objs true)
-                                :bucket "events"
-                                :prefix "org/acme"
-                                :pack-async? false})]
+          retries (atom [])
+          s (s3/store {:client (failing-put-client objs 2 false)
+                       :bucket "events"
+                       :prefix "org/acme"
+                       :pack-async? false
+                       :on-retry #(swap! retries conj (:op %))})]
+      (is (true? (event-store/try-append! s 0 (event 0))))
+      (is (= [:put :put] @retries) "the caller sees no failure, only the result")
+      (is (= (event 0) (event-store/get-event s 0)))))
+
+  (testing "a put that landed before it failed is recognised as ours"
+    (let [objs (objects)
+          s (s3/store {:client (failing-put-client objs 1 true)
+                       :bucket "events"
+                       :prefix "org/acme"
+                       :pack-async? false
+                       :on-retry (constantly nil)})]
+      ;; The first attempt stores the object and then throws, so the retry
+      ;; finds the key taken. Reading it back shows the write was ours.
       (is (true? (event-store/try-append! s 0 (event 0))))))
-  (testing "somebody else's event under the key means we lost"
+
+  (testing "a key taken by somebody else is still a lost race"
     (let [objs (objects)
-          seeded (store objs)]
-      (is (true? (event-store/try-append! seeded 0 (event 0))))
-      (let [s (s3/store {:client (flaky-put-client objs false)
-                                  :bucket "events"
-                                  :prefix "org/acme"
-                                  :pack-async? false})]
-        (is (false? (event-store/try-append! s 0 (event 99)))))))
-  (testing "no object at all leaves the outcome genuinely unknown"
-    (let [objs (objects)
-          s (s3/store {:client (flaky-put-client objs false)
-                                :bucket "events"
-                                :prefix "org/acme"
-                                :pack-async? false})]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                            #"Append outcome ambiguous"
-                            (event-store/try-append! s 0 (event 0)))))))
+          winner (store objs)]
+      (is (true? (event-store/try-append! winner 0 (event 99))))
+      (let [s (s3/store {:client (failing-put-client objs 1 false)
+                         :bucket "events"
+                         :prefix "org/acme"
+                         :pack-async? false
+                         :on-retry (constantly nil)})]
+        (is (false? (event-store/try-append! s 0 (event 0))))
+        (is (= (event 99) (event-store/get-event s 0)))))))
+
+(deftest a-terminal-failure-is-thrown-at-once
+  (let [attempts (atom 0)
+        forbidden (-> (S3Exception/builder) (.statusCode 403) (.message "Forbidden") (.build))
+        client (reify S3Client
+                 (^PutObjectResponse putObject [_ ^PutObjectRequest _request ^RequestBody _body]
+                   (swap! attempts inc)
+                   (throw forbidden)))
+        s (s3/store {:client client
+                     :bucket "events"
+                     :prefix "org/acme"
+                     :pack-async? false
+                     :on-retry (constantly nil)})]
+    (is (thrown? S3Exception (event-store/try-append! s 0 (event 0))))
+    (is (= 1 @attempts)
+        "a bad key or a missing bucket must fail loudly, not retry forever")))
 
 (deftest background-packing-completes
   (let [objects (objects)
