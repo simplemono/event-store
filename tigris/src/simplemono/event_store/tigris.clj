@@ -518,3 +518,177 @@
   (event-store/reduce-events s 0 conj [])
 
   )
+
+(comment
+
+  ;; ==========================================================================
+  ;; Using the library against a real Tigris bucket. Evaluate downwards, one
+  ;; form at a time. Nothing here reaches inside: it is the public API only,
+  ;; so it doubles as the worked example.
+  ;;
+  ;; Each run mints a fresh prefix, so runs never collide. The library never
+  ;; deletes anything, by design — empty the bucket from the Tigris console
+  ;; when it gets untidy.
+  ;; ==========================================================================
+
+  (defn env
+    "Reads env.edn from the project folder, holding :access-key-id,
+     :secret-access-key and :bucket. Gitignored."
+    []
+    (edn/read-string (slurp "env.edn")))
+
+  (keys (env))
+  ;;=> (:access-key-id :secret-access-key :bucket)
+
+  (defn a-store
+    "A store on a fresh prefix, so runs never collide."
+    ([] (a-store {}))
+    ([overrides]
+     (store (merge (env)
+                   {:prefix (str "verify/" (random-uuid))}
+                   overrides))))
+
+  (def s (a-store))
+
+
+  ;; --- the whole protocol --------------------------------------------------
+
+  (event-store/latest-event-number s)
+  ;;=> nil, the stream is empty
+
+  (event-store/try-append! s 0 {:event/occurred-at (java.util.Date.)
+                                :event/type :verify/first
+                                :event/subjects ["/verify/1/"]})
+  ;;=> true
+
+  (event-store/get-event s 0)
+  (event-store/latest-event-number s)
+  ;;=> 0
+
+  (event-store/reduce-events s 0 conj [])
+
+
+  ;; --- a lost append is not an error ---------------------------------------
+
+  (event-store/try-append! s 0 {:event/type :verify/loser})
+  ;;=> false. Another writer holds that number; the stored event is untouched.
+
+  (event-store/get-event s 0)
+
+
+  ;; --- a gap is ------------------------------------------------------------
+
+  (event-store/try-append! s 5 {:event/type :verify/too-far})
+  ;;=> throws {:error :gap}
+
+
+  ;; --- the intended write path ---------------------------------------------
+  ;; Catch a read model up, decide against it, append at its cursor plus one.
+  ;; A false means somebody else won, so it catches up and decides again —
+  ;; which is the whole reason the decision lives inside the loop. Deciding
+  ;; once and retrying the append would re-append a decision made against
+  ;; state that has since moved.
+
+  (defn append-once!
+    "Appends what `decide` returns, or nothing when it returns nil."
+    [store decide]
+    (loop []
+      (let [{:keys [cursor seen]}
+            (event-store/reduce-events store 0
+                                       (fn [acc event]
+                                         (-> acc
+                                             (update :cursor inc)
+                                             (update :seen conj (:event/type event))))
+                                       {:cursor -1 :seen #{}})]
+        (if-some [event (decide seen)]
+          (if (event-store/try-append! store (inc cursor) event)
+            {:appended (:event/type event) :at (inc cursor)}
+            (recur))
+          :nothing-to-append))))
+
+  (defn only-once
+    [seen]
+    (when-not (contains? seen :verify/only-once)
+      {:event/occurred-at (java.util.Date.)
+       :event/type :verify/only-once}))
+
+  (append-once! s only-once)
+  ;;=> {:appended :verify/only-once :at 1}
+
+  (append-once! s only-once)
+  ;;=> :nothing-to-append — the decision saw its own event.
+  ;;   That is the precondition, and it needs no query language.
+
+
+  ;; --- replaying -----------------------------------------------------------
+
+  (doseq [n (range 2 20)]
+    (event-store/try-append! s n {:event/occurred-at (java.util.Date.)
+                                  :event/type :verify/happened
+                                  :event/n n}))
+
+  (mapv :event/n (event-store/reduce-events s 0 conj []))
+  ;;=> [nil nil 2 3 ... 19], in order
+
+  (event-store/reduce-events s 15 conj [])
+  ;;=> a replay can start anywhere
+
+  (event-store/reduce-events s 0
+                             (fn [acc e]
+                               (if (= 3 (count acc)) (reduced acc) (conj acc e)))
+                             [])
+  ;;=> reduced stops it, and stops fetching
+
+  (event-store/reduce-events s 99 conj [])
+  ;;=> [], past the end
+
+
+  ;; --- does a replay see a write that just happened ------------------------
+  ;; The design leans on this: a projection catching up on one machine has to
+  ;; see what another wrote a moment ago. X-Tigris-Consistent is sent by
+  ;; default; the second store below turns it off. Run each several times, a
+  ;; single pass proves nothing about a race.
+
+  (defn append-then-replay!
+    [store]
+    (let [n (inc (long (or (event-store/latest-event-number store) -1)))
+          marker (random-uuid)]
+      (event-store/try-append! store n {:event/type :verify/fresh
+                                        :marker marker})
+      (->> (event-store/reduce-events store 0 conj [])
+           (some #(= marker (:marker %)))
+           boolean)))
+
+  (frequencies (repeatedly 10 #(append-then-replay! s)))
+  ;;=> {true 10} is what the design needs
+
+  (def unguarded (a-store {:prefix (:prefix s)
+                           :headers {"X-Tigris-Consistent" "false"}}))
+
+  (frequencies (repeatedly 10 #(append-then-replay! unguarded)))
+  ;;=> if false ever shows up here while the run above is always true, the
+  ;;   header is doing real work and has to stay
+
+
+  ;; --- a replay versus one request per event -------------------------------
+  ;; Appending is sequential by construction, so the first form takes a while.
+
+  (def big (a-store))
+
+  (time
+   (doseq [n (range 200)]
+     (event-store/try-append! big n {:event/occurred-at (java.util.Date.)
+                                     :event/type :verify/bulk
+                                     :event/n n
+                                     :payload (apply str (repeat 200 "x"))})))
+
+  (time (count (event-store/reduce-events big 0 conj [])))
+  ;;=> one bundle request, plus one LIST for the head
+
+  (time (count (event-store/reduce-by-get big 0 conj [])))
+  ;;=> the generic path every implementation gets: 201 requests
+
+  ;; The Tigris console shows what each cost, and which class a bundle
+  ;; request bills as.
+
+  )

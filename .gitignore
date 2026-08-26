@@ -13,3 +13,4 @@ target/
 
 # REPL port files
 .nrepl-port
+env.edn
