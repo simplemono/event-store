@@ -40,7 +40,12 @@
             :bucket "events"
             :prefix "org/acme"
             :bundle-request (fn [_store keys] (memory-client/tar objects keys))
-            :bundle-size 4}
+            :bundle-size 4
+            ;; These streams are a handful of events long, so the default
+            ;; probe limit would read them one at a time and never reach a
+            ;; bundle. The bundle tests want the bundle path; the probe tests
+            ;; below set their own limit.
+            :probe-limit 0}
            overrides))))
 
 (defn- gunzip
@@ -209,6 +214,124 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"Bundle returned an unexpected object"
                           (event-store/reduce-events s 0 conj [])))))
+
+(defn- counting-client
+  "Wraps a client and counts the two requests a replay can spend: the LIST that
+   finds the head, and the GET that reads one event."
+  [client lists gets]
+  (proxy [software.amazon.awssdk.services.s3.S3Client] []
+    (listObjectsV2 [request]
+      (swap! lists inc)
+      (.listObjectsV2 client request))
+    (getObject [& args]
+      (swap! gets inc)
+      (clojure.lang.Reflector/invokeInstanceMethod client "getObject"
+                                                   (into-array Object args)))
+    (headObject [request] (.headObject client request))
+    (putObject [request body] (.putObject client request body))
+    (close [] (.close client))
+    (serviceName [] (.serviceName client))))
+
+(defn- counting-store
+  "A store reporting what each replay cost: {:lists :gets :bundles}."
+  [objects overrides]
+  (let [lists (atom 0) gets (atom 0) bundles (atom [])
+        s (store objects
+                 (merge {:client (counting-client (memory-client/client objects)
+                                                  lists gets)
+                         :bundle-request (fn [_store keys]
+                                           (swap! bundles conj (count keys))
+                                           (memory-client/tar objects keys))}
+                        overrides))]
+    [s (fn reset-and-report
+         ([] (reset! lists 0) (reset! gets 0) (reset! bundles []) nil)
+         ([_] {:lists @lists :gets @gets :bundles @bundles}))]))
+
+(deftest an-idle-replay-costs-one-get-and-no-list
+  ;; The hot path: a projection asking whether anything happened, when nothing
+  ;; has. One GET is Class B; a LIST is Class A and about ten times the price.
+  (let [objects (objects)
+        [s cost] (counting-store objects {:probe-limit 4})]
+    (append-range! s 0 3)
+    (cost)
+    (is (= [] (event-store/reduce-events s 3 conj [])))
+    (is (= {:lists 0 :gets 1 :bundles []} (cost :report))
+        "the cheapest question is whether the next event exists")))
+
+(deftest a-short-replay-stays-on-single-reads
+  (let [objects (objects)
+        [s cost] (counting-store objects {:probe-limit 4})]
+    (append-range! s 0 3)
+    (cost)
+    (is (= (mapv event (range 1 3)) (event-store/reduce-events s 1 conj [])))
+    (is (= {:lists 0 :gets 3 :bundles []} (cost :report))
+        "two events and the miss that ends it, with no LIST")))
+
+(deftest a-long-replay-escalates-to-the-head-and-bundles
+  (let [objects (objects)
+        [s cost] (counting-store objects {:probe-limit 4 :bundle-size 4})]
+    (append-range! s 0 12)
+    (cost)
+    (is (= (mapv event (range 12)) (event-store/reduce-events s 0 conj [])))
+    (let [{:keys [lists gets bundles]} (cost :report)]
+      (is (= 1 lists) "one LIST, amortised over everything left")
+      (is (= [4 4] bundles) "the rest in bounded batches")
+      (is (= 5 gets)
+          "four single reads to reach the limit, and one past the end: the
+           stream may have grown while we read it, and asking costs a GET
+           rather than the second LIST this used to spend"))))
+
+(deftest known-head-replays-without-a-list-at-all
+  ;; Nothing is ever deleted, so an event number the caller has seen before is
+  ;; still there. A projection replaying up to its own SQLite cursor therefore
+  ;; needs no discovery whatsoever.
+  (let [objects (objects)
+        [s cost] (counting-store objects {:probe-limit 4 :bundle-size 4})]
+    (append-range! s 0 8)
+    (cost)
+    (is (= (mapv event (range 8))
+           (event-store/reduce-events s 0 conj [] {:known-head 7})))
+    (is (= {:lists 0 :gets 1 :bundles [4 4]} (cost :report))
+        "eight known events in two bounded batches and no LIST at all; the one
+         GET is the look past the bound, since a floor cannot rule out growth")))
+
+(deftest known-head-still-finds-what-was-appended-after-it
+  (let [objects (objects)
+        [s cost] (counting-store objects {:probe-limit 4 :bundle-size 4})]
+    (append-range! s 0 6)
+    (cost)
+    (is (= (mapv event (range 6))
+           (event-store/reduce-events s 0 conj [] {:known-head 3}))
+        "the bound is a floor, not a ceiling")
+    (let [{:keys [lists bundles]} (cost :report)]
+      (is (= [4] bundles) "the known range goes in one batch")
+      (is (zero? lists) "and the two after it fit inside the probe limit"))))
+
+(deftest known-head-that-over-promises-is-not-mistaken-for-the-end
+  (let [objects (objects)
+        [s _] (counting-store objects {:probe-limit 4 :bundle-size 8})]
+    (append-range! s 0 3)
+    ;; Claiming events the stream does not hold must fail loudly. Returning the
+    ;; three that exist would look exactly like a correct short replay.
+    (let [t (try (event-store/reduce-events s 0 conj [] {:known-head 20})
+                 nil
+                 (catch clojure.lang.ExceptionInfo t t))]
+      (is (some? t) "an over-promised bound throws")
+      (is (re-find #"does not hold the events" (ex-message t)))
+      (is (= 20 (:known-head (ex-data t)))
+          "and names the promise, so the cause is not a guess"))))
+
+(deftest known-head-is-validated
+  (let [s (store (objects))]
+    (doseq [bad [-1 1.5 "3"]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"non-negative integer"
+                            (event-store/reduce-events s 0 conj [] {:known-head bad}))
+          (str "rejects " (pr-str bad))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"promises nothing"
+                          (event-store/reduce-events s 10 conj [] {:known-head 3}))
+        "a bound below the range being replayed is a caller mistake")))
 
 (deftest headers-the-jdk-owns-are-not-copied-onto-the-request
   ;; The signer returns Host because it is signed, and the JDK's HttpClient

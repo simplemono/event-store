@@ -50,7 +50,7 @@
    protocol is not required: implement it only when the storage can do better,
    the way a collection implements `CollReduce` to beat the generic path.
    `reduce-events` picks whichever is available."
-  (-reduce-events [store from f init]
+  (-reduce-events [store from f init opts]
     "Reduce over the events from `from` onwards. See `reduce-events`."))
 
 (defn reduce-by-get
@@ -68,6 +68,21 @@
         (recur (inc event-number) (f acc event))
         acc))))
 
+(defn- check-known-head
+  [known-head from]
+  (when (some? known-head)
+    (when-not (and (integer? known-head) (not (neg? (long known-head))))
+      (throw (ex-info ":known-head must be a non-negative integer"
+                      {:error :incorrect
+                       :known-head known-head})))
+    (when (< (long known-head) (dec (long from)))
+      (throw (ex-info ":known-head is below the event before `from`, so it
+                       promises nothing about the range being replayed"
+                      {:error :incorrect
+                       :known-head known-head
+                       :from from}))))
+  known-head)
+
 (defn reduce-events
   "Reduce `f` over the events of `store` from `from` onwards, starting at
    `init`, and stop at the first number that does not exist.
@@ -78,8 +93,22 @@
    way it is closed by the time the call returns.
 
    Uses the store's own bulk read when it has one and reads event by event
-   otherwise, so it works on every implementation."
-  [store from f init]
-  (if (satisfies? EventReplay store)
-    (-reduce-events store from f init)
-    (reduce-by-get store from f init)))
+   otherwise, so it works on every implementation.
+
+   `opts` may carry `:known-head`, an event number the caller knows exists.
+   Nothing is ever deleted, so an event number that existed once still does:
+   a number read at any point in the past — a projection cursor written to
+   SQLite, the number an append landed at — is a lower bound on the head that
+   stays true. An implementation may use it to read that range without first
+   discovering where the stream ends, which on an object store is what a LIST
+   is for. It is a promise, not a hint: claiming a number the stream does not
+   hold makes the replay throw rather than quietly return less."
+  ([store from f init]
+   (reduce-events store from f init nil))
+  ([store from f init opts]
+   (check-known-head (:known-head opts) from)
+   (if (satisfies? EventReplay store)
+     (-reduce-events store from f init opts)
+     ;; A store that reads one event at a time learns nothing from a lower
+     ;; bound: it has to fetch every event either way.
+     (reduce-by-get store from f init))))

@@ -148,11 +148,53 @@ loudly if it is still short. The cheap path runs every time and is paid for
 only when it turns out to be wrong.
 
 Two details worth knowing. Event numbers are gap-free, so the keys for a batch
-are computed rather than listed — one LIST for the head bounds the last batch,
-and the replay never asks for a key that cannot exist. And entry names are
-checked against the keys asked for: a gap-free stream cannot legitimately skip
-one, and a replay that quietly dropped an event would be worse than one that
-stopped.
+are computed rather than listed, and the replay never asks for a key that
+cannot exist. And entry names are checked against the keys asked for: a
+gap-free stream cannot legitimately skip one, and a replay that quietly dropped
+an event would be worse than one that stopped.
+
+### What bounds a batch
+
+Every batch has to be bounded by a number the stream is known to reach. Asking
+for a full batch and letting Tigris skip what is missing would also work, and
+is how an earlier version found the end of a stream. It is far worse than it
+looks: a skipped key costs about 7ms, so a 5000-key batch past the end of a
+short stream takes **35 seconds** and answers with half a megabyte of JSON
+naming everything that was not there.
+
+The bound comes from one of three places, cheapest first.
+
+**`:known-head` is free.** Nothing is ever deleted, so an event number the
+caller has already seen still exists — a projection cursor written to SQLite,
+the number an append landed at. That makes it a lower bound on the head which
+stays true forever, and everything up to it can be read without asking where
+the stream ends:
+
+```clojure
+(event-store/reduce-events store 0 conj [] {:known-head cursor})
+```
+
+It is a promise, not a hint. Claiming a number the stream does not hold throws,
+rather than quietly returning less — a short replay that looked correct would
+be far worse.
+
+**Past it, the cheapest question is whether the next event exists**, and the
+answer is the event itself: one GET, which is Class B and is needed anyway. A
+replay that finds nothing there — an idle projection asking whether anything
+happened — costs exactly that one GET and no LIST.
+
+**A replay still going after `:probe-limit` single reads pays for one LIST** and
+goes back to full batches. A LIST is no slower than a GET, it is only Class A,
+so the point is to spend it where there is work to spread it over.
+
+Measured against a real bucket, on a stream of forty events:
+
+| replay | LISTs | GETs | wall clock |
+| --- | --- | --- | --- |
+| idle | 0 | 1 | 72ms |
+| two events behind | 0 | 3 | 110ms |
+| all forty, no bound | 1 | 5 | 892ms |
+| all forty, `:known-head` | **0** | 1 | **110ms** |
 
 `EventReplay` is an *optional* protocol. An implementation adopts it when its
 storage can read in bulk faster than one event at a time, the way a collection
@@ -219,6 +261,7 @@ default provider chain has them, and accepts:
 | `:bundle-request` | the real bundle POST | a fn of `[store keys]` returning a tar `InputStream`, for tests |
 | `:headers` | `X-Tigris-Consistent: true` | extra request headers, merged over the default |
 | `:bundle-size` | `5000` | events per replay request; 5000 is the Tigris maximum |
+| `:probe-limit` | `4` | events a replay reads one at a time past what it knows exists, before spending a LIST on the head |
 | `:on-retry` | prints to `*err*` | called with `{:op :key :attempt :exception}` before each retry |
 
 ## Testing your own code

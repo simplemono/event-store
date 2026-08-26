@@ -425,41 +425,106 @@
                            :got (:read retried)
                            :from (first keys)})))))))
 
+(def ^:private default-probe-limit
+  "How many events a replay reads one at a time past the range it knows exists,
+   before it spends a LIST on finding the head.
+
+   Small, because its only job is to keep the common cases off the LIST: an
+   idle replay stops on the first read, and a projection one or two events
+   behind is done before this runs out. Anything longer has enough work left to
+   amortise a LIST, which is no slower than a GET and only costs more.
+
+   A GET and a LIST take about the same time, so this is a price trade, not a
+   speed one: single reads are the cheaper way to read a handful of events and
+   the dearer way to read many."
+  4)
+
+(defn- over-promised!
+  [known-head t]
+  (throw (ex-info "The stream does not hold the events :known-head promised"
+                  {:error :missing-event
+                   :known-head known-head}
+                  t)))
+
+(defn- bounded-batch
+  "One batch inside a range every key of which is known to exist.
+
+   Nothing is asked for that cannot be there, so this costs one request and no
+   absent-key time. A short batch here is not the end of the stream — the
+   caller promised these events — so it surfaces as the promise being wrong."
+  [{:keys [prefix bundle-size] :as store} event-number latest f acc known-head]
+  (let [to (min (long latest) (dec (+ (long event-number) (long bundle-size))))
+        keys (bundle-keys prefix event-number to)]
+    (try
+      (fetch-batch store keys f acc)
+      (catch clojure.lang.ExceptionInfo t
+        (if (and known-head (= :missing-event (:error (ex-data t))))
+          (over-promised! known-head t)
+          (throw t))))))
+
 (defn- replay
-  "Walk the stream in bundles, never asking for a key that cannot exist.
+  "Walk the stream, never asking for a key that cannot exist.
 
-   The head bounds every batch. Asking for a full batch and letting Tigris skip
-   what is missing would also work, and is how an earlier version found the end
-   of a stream — but it makes the last request of every replay ask for
-   thousands of absent objects, which is wasteful at best. One LIST for the
-   head is cheaper than that, costs nothing extra to read consistently, and is
-   re-read once at the end in case the stream grew while we were reading it."
-  [{:keys [prefix bundle-size] :as store} from f init]
-  (loop [event-number (long from)
-         acc init
-         latest (head store)]
-    (cond
-      (reduced? acc)
-      @acc
+   Asking for a full batch and letting Tigris skip what is missing would also
+   work, and is how an earlier version found the end of a stream. It is far
+   worse than it looks: a skipped key costs about 7ms, so a 5000-key batch past
+   the end of a short stream takes 35 seconds and answers with half a megabyte
+   naming everything that was not there. Every batch is therefore bounded by a
+   number the stream is known to reach.
 
-      (or (nil? latest)
-          (> event-number (long latest)))
-      (let [grown (head store)]
-        (if (and grown (> (long grown) (long (or latest -1))))
-          (recur event-number acc grown)
-          acc))
+   That bound comes from one of three places, cheapest first.
 
-      :else
-      (let [to (min (long latest) (dec (+ event-number (long bundle-size))))
-            keys (bundle-keys prefix event-number to)
-            {:keys [acc read stopped?]} (fetch-batch store keys f acc)]
-        (if stopped?
-          @acc
-          (recur (+ event-number (long read)) acc latest))))))
+   `:known-head` is free. Nothing is ever deleted, so an event number the
+   caller has already seen still exists, and everything up to it can be read
+   without asking where the stream ends. A projection replaying from its own
+   SQLite cursor pays nothing at all to discover the range it already knows.
+
+   Past that, the cheapest question is whether the next event exists, and the
+   answer is the event itself: one GET, which is a Class B operation and is
+   needed anyway. A replay that finds nothing there — an idle projection
+   catching up, which is the common case — costs exactly that one GET and no
+   LIST.
+
+   A replay still going after `:probe-limit` single reads has enough left to
+   amortise a LIST, so it pays for one and goes back to full batches. LIST is
+   no slower than a GET, it is only Class A, so the point is to spend it where
+   there is work to spread it over."
+  [store from f init opts]
+  (let [known-head (:known-head opts)
+        probe-limit (long (:probe-limit store))]
+    (loop [event-number (long from)
+           acc init
+           latest (when known-head (long known-head))
+           probed 0]
+      (cond
+        (reduced? acc)
+        @acc
+
+        (and latest (<= event-number (long latest)))
+        (let [{:keys [acc read stopped?]}
+              (bounded-batch store event-number latest f acc
+                             (when (= latest (some-> known-head long)) known-head))]
+          (if stopped?
+            @acc
+            (recur (+ event-number (long read)) acc latest 0)))
+
+        (< probed probe-limit)
+        (if-some [event (event-object store event-number)]
+          (let [acc (f acc event)]
+            (if (reduced? acc)
+              @acc
+              (recur (inc event-number) acc latest (inc probed))))
+          acc)
+
+        :else
+        (let [grown (head store)]
+          (if (and grown (>= (long grown) event-number))
+            (recur event-number acc (long grown) 0)
+            acc))))))
 
 (defrecord TigrisEventStore [client bucket prefix headers endpoint region
                              credentials-provider http-client bundle-request
-                             bundle-size on-retry]
+                             bundle-size probe-limit on-retry]
   event-store/EventStore
   (try-append! [this event-number event]
     (append! this event-number event))
@@ -471,8 +536,8 @@
     (head this))
 
   event-store/EventReplay
-  (-reduce-events [this from f init]
-    (replay this from f init)))
+  (-reduce-events [this from f init opts]
+    (replay this from f init opts)))
 
 (defn- credentials
   [access-key-id secret-access-key]
@@ -510,13 +575,18 @@
                      tests; the real Tigris bundle request otherwise
    - :headers        extra request headers, merged over X-Tigris-Consistent
    - :bundle-size    events per replay request, default and maximum 5000
+   - :probe-limit    events a replay reads one at a time past what it knows
+                     exists, before spending a LIST to find the head, default 4.
+                     An idle replay stops on the first of these, so it costs one
+                     GET and no LIST.
    - :on-retry       called with {:op :key :attempt :exception} before every
                      retry of a transient failure, defaults to printing a line
                      to *err*. An outage is otherwise indistinguishable from
                      slowness, so replace this with your own logging."
   [{:keys [bucket prefix access-key-id secret-access-key
-           client bundle-request headers bundle-size on-retry]
-    :or {bundle-size bundle/max-keys}}]
+           client bundle-request headers bundle-size probe-limit on-retry]
+    :or {bundle-size bundle/max-keys
+         probe-limit default-probe-limit}}]
   (when (str/blank? (str bucket))
     (throw (ex-info "An event store requires :bucket" {:error :incorrect})))
   (when-not (and (pos-int? bundle-size)
@@ -525,6 +595,10 @@
                     {:error :incorrect
                      :bundle-size bundle-size
                      :maximum bundle/max-keys})))
+  (when-not (and (integer? probe-limit) (not (neg? (long probe-limit))))
+    (throw (ex-info ":probe-limit must be a non-negative integer"
+                    {:error :incorrect
+                     :probe-limit probe-limit})))
   (map->TigrisEventStore
    {:client (or client (simplemono.event-store.tigris/client
                         {:access-key-id access-key-id
@@ -540,6 +614,7 @@
     :http-client (HttpClient/newHttpClient)
     :bundle-request (or bundle-request bundle/request!)
     :bundle-size bundle-size
+    :probe-limit probe-limit
     :on-retry (or on-retry print-retry)}))
 
 (comment

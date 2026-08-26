@@ -82,7 +82,7 @@
                       (latest-event-number [_] 1)
 
                       event-store/EventReplay
-                      (-reduce-events [_ from f init]
+                      (-reduce-events [_ from f init _opts]
                         (swap! called inc)
                         (reduce f init (map event (range from 2)))))]
     (is (= (mapv event (range 2))
