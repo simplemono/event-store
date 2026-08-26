@@ -230,6 +230,71 @@
     (is (= "true" (get headers "X-Tigris-Consistent")))
     (is (= "tar" (get headers "x-tigris-bundle-format")))))
 
+(defn- consistent?
+  [store]
+  (= "true" (get (:headers store) "X-Tigris-Consistent")))
+
+(deftest the-bundle-does-not-pay-for-the-leader
+  (let [objects (objects)
+        seen (atom [])
+        s (store objects {:bundle-request (fn [store keys]
+                                            (swap! seen conj (consistent? store))
+                                            (memory-client/tar objects keys))})]
+    (append-range! s 0 4)
+    (event-store/reduce-events s 0 conj [])
+    (is (= [false] @seen)
+        "reading through the leader costs about five times the latency on a
+         bundle, and buys nothing an object store that never updates an object
+         can give back")))
+
+(deftest a-short-batch-is-read-again-through-the-leader
+  ;; The head promised four events. A replica that has not caught up returns
+  ;; three, and returning those would silently truncate the replay -- the
+  ;; caller would rebuild a read model missing an event and never know.
+  (let [objects (objects)
+        seen (atom [])
+        stale? (atom true)
+        s (store objects
+                 {:bundle-request
+                  (fn [store keys]
+                    (swap! seen conj (consistent? store))
+                    (if (and @stale? (not (consistent? store)))
+                      (memory-client/tar objects (butlast keys))
+                      (memory-client/tar objects keys)))})]
+    (append-range! s 0 4)
+    (is (= (mapv event (range 4))
+           (event-store/reduce-events s 0 conj []))
+        "every event still arrives")
+    (is (= [false true] @seen)
+        "the cheap read came up short, so the batch was read again consistently")
+
+    (testing "and a batch that is short even through the leader fails loudly"
+      (reset! seen [])
+      (reset! stale? false)
+      (let [always-short (store objects
+                                {:bundle-request
+                                 (fn [_store keys]
+                                   (memory-client/tar objects (butlast keys)))})]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"fewer events than the stream holds"
+             (event-store/reduce-events always-short 0 conj [])))))))
+
+(deftest f-stopping-early-is-not-mistaken-for-a-short-batch
+  (let [objects (objects)
+        seen (atom [])
+        s (store objects {:bundle-request (fn [store keys]
+                                            (swap! seen conj (consistent? store))
+                                            (memory-client/tar objects keys))})]
+    (append-range! s 0 8)
+    (is (= (mapv event (range 2))
+           (event-store/reduce-events s 0
+                                      (fn [acc e]
+                                        (if (= 2 (count acc)) (reduced acc) (conj acc e)))
+                                      [])))
+    (is (= [false] @seen)
+        "`f` ending it is ordinary, so there is nothing to re-read")))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'simplemono.event-store.tigris-test)]
     (when (pos? (+ fail error))

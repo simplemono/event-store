@@ -137,6 +137,16 @@ Nothing is written to make this fast. There are no packs, no index, no
 compaction, nothing to keep current and nothing to rebuild after a schema
 change — and the first replay of a stream is exactly as cheap as the tenth.
 
+**The bundle is the one request that does not go through the leader.**
+`X-Tigris-Consistent` costs roughly five times the latency on a bundle and
+nothing measurable on the LIST that bounds it, and it buys less than it looks:
+event objects are immutable and create-only, so an eventually consistent read
+can only be *missing* an object, never show an old version of one. A missing
+one is detectable — a batch shorter than the head promised, for a reason the
+reducing function did not cause — and is read again through the leader, failing
+loudly if it is still short. The cheap path runs every time and is paid for
+only when it turns out to be wrong.
+
 Two details worth knowing. Event numbers are gap-free, so the keys for a batch
 are computed rather than listed — one LIST for the head bounds the last batch,
 and the replay never asks for a key that cannot exist. And entry names are

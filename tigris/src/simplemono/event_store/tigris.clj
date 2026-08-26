@@ -18,6 +18,15 @@
    make that fast: there are no packs, nothing to build, nothing to keep
    current, and the first replay of a stream is as cheap as the tenth.
 
+   Every request but the bundle is routed through the leader with
+   X-Tigris-Consistent, so a replay on one machine sees what another wrote a
+   moment ago. The bundle is not: it costs about five times the latency there,
+   and event objects are immutable and create-only, so an eventually consistent
+   read can only be missing an object, never showing an old version of one. A
+   batch that comes back short for a reason the reducing function did not cause
+   is read again through the leader, and fails loudly if it is still short —
+   so the cheap path is taken every time and paid for only when it is wrong.
+
    Transient failures never reach the caller. Every request is retried, with
    backoff, until Tigris answers: a client-side exception, a 429 or a 5xx means
    try again, while a 4xx means the request itself is wrong and is thrown at
@@ -64,6 +73,20 @@
                                                      PutObjectRequest
                                                      S3Exception
                                                      S3Object)))
+
+(def endpoint
+  "Tigris speaks S3 at one global endpoint."
+  "https://t3.storage.dev")
+
+(def region
+  "Tigris routes by itself; the region is only there for the signature."
+  "auto")
+
+(def consistent-header
+  "Route through the leader so that a read sees a write another machine made a
+   moment ago. A replay after a failover, or a projection catching up on a
+   second cell, depends on it."
+  {"X-Tigris-Consistent" "true"})
 
 (def ^:private number-width
   "Digits needed for Long/MAX_VALUE, so every inverted number sorts correctly."
@@ -332,33 +355,75 @@
 
 (defn- reduce-bundle
   "Reduce `f` over the events at `keys`, in the order asked for. Returns
-   [acc read].
+   {:acc :read :stopped?}, where :read is how many events reached `f` and
+   :stopped? says whether `f` ended it by returning `reduced`.
+
+   Keeping those apart is what makes a short batch meaningful: `f` stopping is
+   ordinary, while a batch that ran out of events the head promised means the
+   object store is behind.
 
    Entry names are checked against the keys, because a gap-free stream cannot
    legitimately skip one and a replay that quietly dropped an event would be
-   far worse than one that stopped. Tigris leaves a key with no object out of
-   the archive rather than failing, so `read` also reports how far the batch
-   actually got."
+   far worse than one that stopped."
   [store keys f init]
   (with-open [tar ((:bundle-request store) store keys)]
-    (let [result
-          (bundle/reduce-tar
-           tar
-           (fn [[acc read] [name ^bytes content]]
-             (if (= "__bundle_errors.json" name)
-               (reduced [acc read])
-               (let [expected (nth keys read nil)]
-                 (when-not (= expected name)
-                   (throw (ex-info "Bundle returned an unexpected object"
-                                   {:error :missing-event
-                                    :expected expected
-                                    :got name})))
-                 (let [acc (f acc (decode content))]
-                   (if (reduced? acc)
-                     (reduced [acc (inc (long read))])
-                     [acc (inc (long read))])))))
-           [init 0])]
-      result)))
+    (bundle/reduce-tar
+     tar
+     (fn [{:keys [acc read] :as state} [name ^bytes content]]
+       (if (= "__bundle_errors.json" name)
+         (reduced state)
+         (let [expected (nth keys read nil)]
+           (when-not (= expected name)
+             (throw (ex-info "Bundle returned an unexpected object"
+                             {:error :missing-event
+                              :expected expected
+                              :got name})))
+           (let [acc (f acc (decode content))
+                 state {:acc acc :read (inc (long read)) :stopped? (reduced? acc)}]
+             (if (reduced? acc)
+               (reduced state)
+               state)))))
+     {:acc init :read 0 :stopped? false})))
+
+(defn- relaxed
+  "The same store, not routed through the leader.
+
+   Only the bundle uses this. Reading through the leader costs about five
+   times the latency there, and it buys less than it looks: event objects are
+   immutable and create-only, so an eventually consistent read can only be
+   missing an object, never showing an old version of one. A missing one is
+   detectable — see `fetch-batch` — which is better than paying for it on
+   every batch."
+  [store]
+  (update store :headers dissoc (key (first consistent-header))))
+
+(defn- consistent
+  "The same store, routed through the leader."
+  [store]
+  (update store :headers merge consistent-header))
+
+(defn- fetch-batch
+  "One batch, read the cheap way, and read again through the leader when the
+   cheap read came up short for a reason `f` did not cause.
+
+   A short batch means the head promised events the bundle did not return. In
+   one region that should never happen; across regions it is a replica that
+   has not caught up. Either way, returning what arrived would silently
+   truncate the replay, so the batch is fetched again consistently and, if it
+   is still short, the replay fails instead."
+  [store keys f init]
+  (let [{:keys [read stopped?] :as result} (reduce-bundle (relaxed store) keys f init)]
+    (if (or stopped? (= read (count keys)))
+      result
+      (let [retried (reduce-bundle (consistent store) keys f init)]
+        (if (or (:stopped? retried)
+                (= (:read retried) (count keys)))
+          retried
+          (throw (ex-info "The bundle returned fewer events than the stream holds"
+                          {:error :missing-event
+                           :expected (count keys)
+                           :got (:read retried)
+                           :from (first keys)})))))))
 
 (defn- replay
   "Walk the stream in bundles, never asking for a key that cannot exist.
@@ -367,8 +432,8 @@
    what is missing would also work, and is how an earlier version found the end
    of a stream — but it makes the last request of every replay ask for
    thousands of absent objects, which is wasteful at best. One LIST for the
-   head is cheaper than that, and it is re-read once at the end in case the
-   stream grew while we were reading it."
+   head is cheaper than that, costs nothing extra to read consistently, and is
+   re-read once at the end in case the stream grew while we were reading it."
   [{:keys [prefix bundle-size] :as store} from f init]
   (loop [event-number (long from)
          acc init
@@ -387,11 +452,9 @@
       :else
       (let [to (min (long latest) (dec (+ event-number (long bundle-size))))
             keys (bundle-keys prefix event-number to)
-            [acc read] (reduce-bundle store keys f acc)]
-        (if (< (long read) (count keys))
-          ;; Either `f` stopped early, or an event the head promised was not
-          ;; there — both mean this traversal is over.
-          (if (reduced? acc) @acc acc)
+            {:keys [acc read stopped?]} (fetch-batch store keys f acc)]
+        (if stopped?
+          @acc
           (recur (+ event-number (long read)) acc latest))))))
 
 (defrecord TigrisEventStore [client bucket prefix headers endpoint region
@@ -410,20 +473,6 @@
   event-store/EventReplay
   (-reduce-events [this from f init]
     (replay this from f init)))
-
-(def endpoint
-  "Tigris speaks S3 at one global endpoint."
-  "https://t3.storage.dev")
-
-(def region
-  "Tigris routes by itself; the region is only there for the signature."
-  "auto")
-
-(def consistent-header
-  "Route through the leader so that a read sees a write another machine made a
-   moment ago. A replay after a failover, or a projection catching up on a
-   second cell, depends on it."
-  {"X-Tigris-Consistent" "true"})
 
 (defn- credentials
   [access-key-id secret-access-key]
