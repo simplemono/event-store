@@ -3,14 +3,17 @@
 
    It is a fake transport rather than a second storage backend, so a test runs
    the real `simplemono.event-store` code: the same key encoding, the same
-   inverted ordering, the same gzip, the same create-only put and the same
-   packing. Only the network is missing.
+   inverted ordering, the same gzip, the same create-only put and the same tar
+   parsing. Only the network is missing.
 
    It implements exactly the four operations the event store performs —
    putObject with If-None-Match, getObject, headObject and a prefix listing
-   with maxKeys — and nothing else."
+   with maxKeys — and nothing else. `tar` stands in for the Tigris bundle API,
+   which is not an S3 operation at all."
   (:require [clojure.string :as str])
   (:import (java.io ByteArrayInputStream ByteArrayOutputStream)
+           (org.apache.commons.compress.archivers.tar TarArchiveEntry
+                                                      TarArchiveOutputStream)
            (software.amazon.awssdk.core ResponseInputStream)
            (software.amazon.awssdk.core.sync RequestBody)
            (software.amazon.awssdk.services.s3 S3Client)
@@ -96,3 +99,26 @@
              (.contents contents)
              (.isTruncated (boolean (> (count matching) (count contents))))
              (.build)))))))
+
+(defn tar
+  "A tar of the objects at `keys`, in that order, as an InputStream.
+
+   Mimics the Tigris bundle API closely enough to exercise a real tar reader.
+   A key with no object is left out, the way `x-tigris-bundle-on-error: skip`
+   behaves. Long-file mode is POSIX because that is what Tigris does: a key
+   that fits is a plain ustar entry and a longer one becomes a pax extended
+   header, so a reader that only understands ustar fails here as it would
+   there."
+  [objects keys]
+  (let [bytes (ByteArrayOutputStream.)]
+    (with-open [out (TarArchiveOutputStream. bytes)]
+      (.setLongFileMode out TarArchiveOutputStream/LONGFILE_POSIX)
+      (doseq [key keys
+              :let [^bytes content (get @objects key)]
+              :when content]
+        (let [entry (TarArchiveEntry. ^String key)]
+          (.setSize entry (alength content))
+          (.putArchiveEntry out entry)
+          (.write out content)
+          (.closeArchiveEntry out))))
+    (ByteArrayInputStream. (.toByteArray bytes))))

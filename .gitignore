@@ -7,3 +7,10 @@ target/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Credentials for the REPL verification against a real bucket
+.env
+
+# REPL port files
+.nrepl-port
+env.edn

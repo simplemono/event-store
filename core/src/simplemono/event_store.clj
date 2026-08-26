@@ -42,3 +42,44 @@
 
   (latest-event-number [store]
     "The highest event number in the stream, or nil when the stream is empty."))
+
+(defprotocol EventReplay
+  "An optional acceleration for reading a stream in bulk.
+
+   Every `EventStore` can be replayed by fetching one event at a time, so this
+   protocol is not required: implement it only when the storage can do better,
+   the way a collection implements `CollReduce` to beat the generic path.
+   `reduce-events` picks whichever is available."
+  (-reduce-events [store from f init]
+    "Reduce over the events from `from` onwards. See `reduce-events`."))
+
+(defn reduce-by-get
+  "Reduce over the events from `from` onwards by fetching them one at a time.
+
+   The generic replay: correct for any `EventStore`, and what `reduce-events`
+   falls back to. An implementation of `EventReplay` that only accelerates part
+   of a stream can delegate the rest here."
+  [store from f init]
+  (loop [event-number (long from)
+         acc init]
+    (if (reduced? acc)
+      @acc
+      (if-some [event (get-event store event-number)]
+        (recur (inc event-number) (f acc event))
+        acc))))
+
+(defn reduce-events
+  "Reduce `f` over the events of `store` from `from` onwards, starting at
+   `init`, and stop at the first number that does not exist.
+
+   `f` is called with the accumulator and one event, and may return `reduced`
+   to stop early. Reducing rather than returning a sequence is deliberate: the
+   storage may hold a connection or a stream open for the traversal, and this
+   way it is closed by the time the call returns.
+
+   Uses the store's own bulk read when it has one and reads event by event
+   otherwise, so it works on every implementation."
+  [store from f init]
+  (if (satisfies? EventReplay store)
+    (-reduce-events store from f init)
+    (reduce-by-get store from f init)))

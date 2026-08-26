@@ -1,13 +1,20 @@
 # simplemono/event-store
 
-A minimal append-only event log on S3-compatible object storage.
+An append-only event log on [Tigris](https://www.tigrisdata.com/).
 
-One store is one stream. Everything it owns lives under one prefix:
+It is built for the projects it is used in rather than for everyone: it targets
+Tigris specifically, and leans on two things Tigris gives you that plain S3 does
+not — global strong consistency on demand, and an API that returns thousands of
+objects in one request.
+
+One store is one stream, under one prefix in one bucket:
 
 ```
-{prefix}/events/{inverted-19d}              one gzip-EDN object per event
-{prefix}/packs/{pack-size}/{inverted-19d}   one gzip-EDN vector per :pack-size events
+{prefix}/events/{inverted-19d}   one gzip-EDN object per event
 ```
+
+That is the entire layout. There is nothing else to build, keep current or
+clean up.
 
 Object names use an inverted key-space (`Long/MAX_VALUE - n`, zero-padded to 19
 digits), so the newest object sorts first and finding the head is one LIST with
@@ -17,38 +24,35 @@ digits), so the newest object sorts first and finding the head is one LIST with
 
 | module | namespace | depends on |
 | --- | --- | --- |
-| `core` | `simplemono.event-store` — the `EventStore` protocol | nothing |
-| `s3` | `simplemono.event-store.s3` — the S3 implementation | `core`, `awssdk/s3` |
+| `core` | `simplemono.event-store` — the `EventStore` and `EventReplay` protocols | nothing |
+| `tigris` | `simplemono.event-store.tigris` — the implementation | `core`, `awssdk/s3`, `commons-compress` |
 | `memory` | `simplemono.event-store.memory` — an in-memory implementation | `core` |
+| `memory-client` | `simplemono.event-store.memory-client` — test doubles | `awssdk/s3`, `commons-compress` |
 
-The protocol namespace has no dependencies of its own, so a future file-,
-SQLite- or whatever-backed implementation can satisfy it without pulling in the
-AWS SDK — `memory` is the worked example.
+The protocol namespace has no dependencies of its own, so another
+implementation can satisfy it without pulling in the AWS SDK — `memory` is the
+worked example.
 
 ```clojure
-simplemono/event-store-s3 {:git/url "https://github.com/simplemono/event-store.git"
-                           :sha "…"
-                           :deps/root "s3"}
+simplemono/event-store-tigris {:git/url "https://github.com/simplemono/event-store.git"
+                               :sha "…"
+                               :deps/root "tigris"}
 ```
 
 `core` comes along with it; depend on `:deps/root "core"` alone when you only
-need the protocol.
+need the protocol, and on `memory` in your tests.
 
 ## Usage
 
 ```clojure
 (require '[simplemono.event-store :as event-store]
-         '[simplemono.event-store.s3 :as s3])
+         '[simplemono.event-store.tigris :as tigris])
 
 (def store
-  (s3/store
-   {:client (s3/client {:endpoint "https://t3.storage.dev"
-                        :region "auto"
-                        :access-key-id "…"
-                        :secret-access-key "…"})
-    :bucket "events"
-    :prefix "org/acme"
-    :headers {"X-Tigris-Consistent" "true"}}))
+  (tigris/store {:bucket "events"
+                 :prefix "org/acme"
+                 :access-key-id "…"
+                 :secret-access-key "…"}))
 
 (event-store/try-append! store 0 {:event/type :example/happened})
 ;; => true
@@ -58,10 +62,13 @@ need the protocol.
 
 (event-store/latest-event-number store)
 ;; => 0
+
+(event-store/reduce-events store 0 conj [])
+;; => [{:event/type :example/happened}]
 ```
 
-Those three are the whole protocol. `s3/store` builds an implementation of it
-and `s3/client` builds an `S3Client`.
+The endpoint and region are Tigris's own, and `X-Tigris-Consistent` is sent by
+default — a replay on one cell has to see what another wrote a moment ago.
 
 ## Appending
 
@@ -110,27 +117,53 @@ That is why events must round-trip unchanged, and it is the reason there is no
 implementation's job, because only the implementation knows what it wrote and
 where. A `false` from `try-append!` always means somebody else won.
 
-## Packing
+## Replaying
 
-Packing is an implementation detail. Completing a range of `:pack-size` events
-starts a background thread that writes the packs, and `get-event` reads from a
-pack whenever one covers the number. A full replay then costs one request per
-thousand events instead of one per event.
+```clojure
+(event-store/reduce-events store 0 conj [])
+```
 
-Event objects are never deleted, so a pack that is missing, stale or corrupt
-only makes reads slower, never wrong.
+It reduces rather than returning a sequence on purpose: the implementation
+holds a stream open for the traversal, and a callback closes it by the time the
+call returns. `f` may return `reduced` to stop early, and the traversal stops at
+the first event number that does not exist.
 
-Packs are namespaced by their size. Changing `:pack-size` on an existing stream
-therefore starts a fresh set of packs and re-packs from event 0, instead of
-writing new-size packs at indices that already mean something else. The old
-packs are orphaned rather than corrupt: they are never read again, and
-`packs/{old-size}/` can be deleted whenever convenient.
+**A replay does not read one object per event.** Tigris can return many objects
+as a single streaming tar — `POST /{bucket}?bundle` with a list of keys — so a
+replay costs **one request per `:bundle-size` events**, 5000 by default. For
+thirty million events that is six thousand requests instead of thirty million.
+
+Nothing is written to make this fast. There are no packs, no index, no
+compaction, nothing to keep current and nothing to rebuild after a schema
+change — and the first replay of a stream is exactly as cheap as the tenth.
+
+**The bundle is the one request that does not go through the leader.**
+`X-Tigris-Consistent` costs roughly five times the latency on a bundle and
+nothing measurable on the LIST that bounds it, and it buys less than it looks:
+event objects are immutable and create-only, so an eventually consistent read
+can only be *missing* an object, never show an old version of one. A missing
+one is detectable — a batch shorter than the head promised, for a reason the
+reducing function did not cause — and is read again through the leader, failing
+loudly if it is still short. The cheap path runs every time and is paid for
+only when it turns out to be wrong.
+
+Two details worth knowing. Event numbers are gap-free, so the keys for a batch
+are computed rather than listed — one LIST for the head bounds the last batch,
+and the replay never asks for a key that cannot exist. And entry names are
+checked against the keys asked for: a gap-free stream cannot legitimately skip
+one, and a replay that quietly dropped an event would be worse than one that
+stopped.
+
+`EventReplay` is an *optional* protocol. An implementation adopts it when its
+storage can read in bulk faster than one event at a time, the way a collection
+implements `CollReduce` to beat the generic path. `memory` does not, and
+replays through the fallback.
 
 ## Events
 
-Events must be EDN round-trippable values, and should stay small: `:pack-size`
-of them end up in one pack object. Keep large payloads in a blob store and put
-the blob's name in the event.
+Events must be EDN round-trippable values, and should stay small: a replay
+pulls `:bundle-size` of them in one response. Keep large payloads in a blob
+store and put the blob's name in the event.
 
 ## Why single events, not commits
 
@@ -153,7 +186,7 @@ Legend: 🟢 advantage · 🟡 neutral · 🔴 disadvantage
 | 8 | Batching as a use case | 🟡 | 🟢 | A commit boundary carries no domain meaning and is invisible to anything reading events |
 | 9 | Pressure to model the domain | 🔴 | 🟢 | Commits make it easy to *avoid* naming the fact that things happened together |
 | 10 | Type-filtered replay | 🟡 | 🟢 | A mixed commit can never be skipped; a single event is one keyword test |
-| 11 | Entry size and pack density | 🟡 | 🟢 | Batch commits vary in size; single events are uniform, so packs are predictable |
+| 11 | Entry size | 🟡 | 🟢 | Batch commits vary in size; single events are uniform, so a bundle's size is predictable |
 | 12 | Envelope complexity | 🔴 | 🟢 | Two nesting levels, two ids and two timestamps versus one flat map |
 
 **Rows 6 and 7 are the real case for commits, and they are the same case.**
@@ -177,15 +210,15 @@ log.
 
 ## Options
 
-`s3/store` requires `:client`, `:bucket` and `:prefix`, and accepts:
+`tigris/store` requires `:bucket` and `:prefix`, plus credentials unless the
+default provider chain has them, and accepts:
 
 | option | default | meaning |
 | --- | --- | --- |
-| `:headers` | `{}` | extra request headers |
-| `:pack-size` | `1000` | events per pack |
-| `:pack?` | `true` | set false to never pack |
-| `:pack-async?` | `true` | set false to pack on the appending thread |
-| `:on-pack-error` | prints to `*err*` | called with the Throwable when background packing fails |
+| `:client` | built from the credentials | an `S3Client`, if you would rather build it or hand in a double |
+| `:bundle-request` | the real bundle POST | a fn of `[store keys]` returning a tar `InputStream`, for tests |
+| `:headers` | `X-Tigris-Consistent: true` | extra request headers, merged over the default |
+| `:bundle-size` | `5000` | events per replay request; 5000 is the Tigris maximum |
 | `:on-retry` | prints to `*err*` | called with `{:op :key :attempt :exception}` before each retry |
 
 ## Testing your own code
@@ -199,27 +232,35 @@ Depend on `memory` and build a store that needs no network:
 (def store (memory/store))
 
 (event-store/try-append! store 0 {:event/type :example/happened})
+(event-store/reduce-events store 0 conj [])
 ```
 
 Pass your own atom over a sorted map to `memory/store` to seed a stream or to
 inspect one. Appends are serialised, so concurrent writers see the same
-create-only, gap-free behaviour an object store gives them. What it cannot
-reproduce is a network: there is no retrying and no uncertain write, because
-an append here either happened or threw.
+create-only, gap-free behaviour Tigris gives them. What it cannot reproduce is a
+network: there is no retrying and no uncertain write, because an append here
+either happened or threw.
 
 ## Testing this library
 
-Each module runs its own suite:
-
 ```
-cd core   && clojure -M:test   # nothing to run — the protocol has no code
 cd memory && clojure -M:test
-cd s3     && clojure -M:test
+cd tigris && clojure -M:test
 ```
 
-The `s3` suite runs against an in-memory `S3Client` living in its test path,
-so it exercises the real code — the same key encoding, inverted ordering,
-gzip, create-only put, retrying and packing — with only the network missing.
+The `tigris` suite runs against `memory-client`, which fakes the two transports
+this library uses: an in-memory `S3Client`, and a `tar` function standing in for
+the bundle API. They are fakes of the transport, not of the store, so the suite
+exercises the real code — the same key encoding, inverted ordering, gzip,
+create-only put, retrying and tar parsing — with only the network missing.
+
+The fake writes its archives with Commons Compress in POSIX long-file mode, so
+a long key becomes a pax extended header there as it does on Tigris. It is not
+an exact mimic: it reaches for pax at 100 characters where Tigris keeps
+splitting into the ustar name prefix until 256, so the suite covers plain ustar
+and pax while Tigris's middle case needs a real bucket.
+
+Nothing depends on `memory-client` at runtime; it is a `:test` dependency.
 
 ## License
 
