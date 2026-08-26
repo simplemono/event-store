@@ -13,10 +13,10 @@
 
    Replaying does not read one object per event. Tigris can return many objects
    as one streaming tar — see `simplemono.event-store.tigris.bundle` — so
-   `reduce-events` costs one request per :bundle-size events, 5000 by default.
-   Nothing is written to make that fast: there are no packs, nothing to build,
-   nothing to keep current, and the first replay of a stream is as cheap as the
-   tenth.
+   `reduce-events` costs one request per :bundle-size events, 5000 by default,
+   plus one LIST for the head that bounds the last batch. Nothing is written to
+   make that fast: there are no packs, nothing to build, nothing to keep
+   current, and the first replay of a stream is as cheap as the tenth.
 
    Transient failures never reach the caller. Every request is retried, with
    backoff, until Tigris answers: a client-side exception, a 429 or a 5xx means
@@ -321,8 +321,9 @@
                   (.getMessage exception)))))
 
 (defn- bundle-keys
-  [prefix from size]
-  (mapv #(event-key prefix %) (range (long from) (+ (long from) (long size)))))
+  "The keys for events [from, to], inclusive."
+  [prefix from to]
+  (mapv #(event-key prefix %) (range (long from) (inc (long to)))))
 
 (defn- decode
   [^bytes gzipped]
@@ -333,11 +334,11 @@
   "Reduce `f` over the events at `keys`, in the order asked for. Returns
    [acc read].
 
-   Tigris leaves a key with no object out of the archive, so `read` is how a
-   replay learns the stream ended: fewer entries than keys means there was
-   nothing more to fetch. Entry names are checked against the keys anyway,
-   because a gap-free stream cannot legitimately skip one, and a replay that
-   quietly dropped an event would be far worse than one that stopped."
+   Entry names are checked against the keys, because a gap-free stream cannot
+   legitimately skip one and a replay that quietly dropped an event would be
+   far worse than one that stopped. Tigris leaves a key with no object out of
+   the archive rather than failing, so `read` also reports how far the batch
+   actually got."
   [store keys f init]
   (with-open [tar ((:bundle-request store) store keys)]
     (let [result
@@ -360,16 +361,38 @@
       result)))
 
 (defn- replay
+  "Walk the stream in bundles, never asking for a key that cannot exist.
+
+   The head bounds every batch. Asking for a full batch and letting Tigris skip
+   what is missing would also work, and is how an earlier version found the end
+   of a stream — but it makes the last request of every replay ask for
+   thousands of absent objects, which is wasteful at best. One LIST for the
+   head is cheaper than that, and it is re-read once at the end in case the
+   stream grew while we were reading it."
   [{:keys [prefix bundle-size] :as store} from f init]
   (loop [event-number (long from)
-         acc init]
-    (if (reduced? acc)
+         acc init
+         latest (head store)]
+    (cond
+      (reduced? acc)
       @acc
-      (let [keys (bundle-keys prefix event-number bundle-size)
+
+      (or (nil? latest)
+          (> event-number (long latest)))
+      (let [grown (head store)]
+        (if (and grown (> (long grown) (long (or latest -1))))
+          (recur event-number acc grown)
+          acc))
+
+      :else
+      (let [to (min (long latest) (dec (+ event-number (long bundle-size))))
+            keys (bundle-keys prefix event-number to)
             [acc read] (reduce-bundle store keys f acc)]
         (if (< (long read) (count keys))
+          ;; Either `f` stopped early, or an event the head promised was not
+          ;; there — both mean this traversal is over.
           (if (reduced? acc) @acc acc)
-          (recur (+ event-number (long read)) acc))))))
+          (recur (+ event-number (long read)) acc latest))))))
 
 (defrecord TigrisEventStore [client bucket prefix headers endpoint region
                              credentials-provider http-client bundle-request
@@ -472,9 +495,12 @@
 
 (comment
 
+  ;; ==========================================================================
+  ;; Offline: a fake S3Client, and a bundle built from the same objects.
+  ;; ==========================================================================
+
   (require '[simplemono.event-store.memory-client :as memory-client])
 
-  ;; Offline: a fake S3Client, and a bundle built from the same objects.
   (def objects (atom (sorted-map)))
 
   (def s (store {:bucket "events"
@@ -490,14 +516,5 @@
   (event-store/latest-event-number s)
   (event-store/get-event s 3)
   (event-store/reduce-events s 0 conj [])
-
-  ;; Against a real bucket:
-  (def real (store {:bucket "dev-<uuid>"
-                    :prefix "org/acme"
-                    :access-key-id (System/getenv "EVENT_STORE_ACCESS_KEY_ID")
-                    :secret-access-key (System/getenv "EVENT_STORE_SECRET_ACCESS_KEY")}))
-
-  (event-store/try-append! real 0 {:event/type :example/happened})
-  (event-store/reduce-events real 0 conj [])
 
   )

@@ -17,6 +17,7 @@
   (:require [clojure.string :as str])
   (:import (java.io InputStream)
            (java.net URI)
+           (java.time Duration)
            (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
                           HttpResponse$BodyHandlers)
            (java.nio.charset StandardCharsets)
@@ -47,6 +48,13 @@
                                        {:error :truncated-bundle
                                         :expected len
                                         :got offset})))
+            ;; A stream is allowed to hand back nothing without being at its
+            ;; end. Recurring on the same offset would spin here forever, so
+            ;; give up rather than hang.
+            (zero? n) (throw (ex-info "Bundle stream stalled"
+                                      {:error :unavailable
+                                       :expected len
+                                       :got offset}))
             :else (recur (+ offset n))))))))
 
 (defn- trimmed
@@ -140,26 +148,49 @@
                           keys))
        "]}"))
 
+(def ^:private restricted-headers
+  "Headers the JDK's HttpClient manages itself and refuses to let a caller set.
+
+   Host is among them and is also part of the SigV4 signature, but the JDK
+   derives it from the same URI we signed, so the header that goes out is
+   identical and dropping it here changes nothing."
+  #{"connection" "content-length" "expect" "host" "upgrade"})
+
+(defn settable-headers
+  "The headers to put on the request: everything signed, then ours, minus the
+   ones the JDK insists on owning. Returns a seq of [name value]."
+  [signed extra]
+  (concat
+   (for [[k vs] signed
+         :when (not (restricted-headers (str/lower-case (str k))))
+         v vs]
+     [(str k) (str v)])
+   (for [[k v] extra
+         :when (not (restricted-headers (str/lower-case (str k))))]
+     [(str k) (str v)])))
+
 (defn request!
   "POST the bundle and return the tar as an InputStream. The caller closes it.
 
    `on-error` is \"skip\" — a key with no object is left out of the archive
-   rather than failing the whole request, which is how a replay discovers the
-   end of a stream: it asks for a full batch and gets back however many exist."
+   rather than failing the whole request. A replay bounds its batches by the
+   head and so does not rely on that, but it means one object disappearing
+   under a reader degrades to a short archive instead of a failed request."
   [{:keys [^HttpClient http-client bucket endpoint headers] :as config} keys]
   (let [host (str/replace (str endpoint) #"^https?://" "")
         url (str "https://" bucket "." host "/?bundle")
         body (.getBytes (json-keys keys) StandardCharsets/UTF_8)
         builder (-> (HttpRequest/newBuilder)
                     (.uri (URI/create url))
+                    ;; Tigris allows a bundle fifteen minutes. Without a
+                    ;; timeout of our own a stalled connection simply hangs.
+                    (.timeout (Duration/ofMinutes 15))
                     (.POST (HttpRequest$BodyPublishers/ofByteArray body)))]
-    (doseq [[k vs] (signed-headers config url body)
-            v vs]
-      (.header builder (str k) (str v)))
-    (doseq [[k v] headers]
-      (.header builder (str k) (str v)))
-    (.header builder "x-tigris-bundle-format" "tar")
-    (.header builder "x-tigris-bundle-on-error" "skip")
+    (doseq [[k v] (settable-headers (signed-headers config url body)
+                                    (merge headers
+                                           {"x-tigris-bundle-format" "tar"
+                                            "x-tigris-bundle-on-error" "skip"}))]
+      (.header builder k v))
     (let [response (.send http-client
                           (.build builder)
                           (HttpResponse$BodyHandlers/ofInputStream))

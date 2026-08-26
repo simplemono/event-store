@@ -138,11 +138,11 @@ compaction, nothing to keep current and nothing to rebuild after a schema
 change — and the first replay of a stream is exactly as cheap as the tenth.
 
 Two details worth knowing. Event numbers are gap-free, so the keys for a batch
-are computed rather than listed. And a key with no object is simply left out of
-the archive, which is how a replay discovers the end of a stream: it asks for a
-full batch and gets back however many exist. Entry names are checked against the
-keys anyway — a gap-free stream cannot legitimately skip one, and a replay that
-quietly dropped an event would be worse than one that stopped.
+are computed rather than listed — one LIST for the head bounds the last batch,
+and the replay never asks for a key that cannot exist. And entry names are
+checked against the keys asked for: a gap-free stream cannot legitimately skip
+one, and a replay that quietly dropped an event would be worse than one that
+stopped.
 
 `EventReplay` is an *optional* protocol. An implementation adopts it when its
 storage can read in bulk faster than one event at a time, the way a collection

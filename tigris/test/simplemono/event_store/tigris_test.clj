@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is run-tests testing]]
             [simplemono.event-store :as event-store]
             [simplemono.event-store.memory-client :as memory-client]
-            [simplemono.event-store.tigris :as tigris])
+            [simplemono.event-store.tigris :as tigris]
+            [simplemono.event-store.tigris.bundle :as bundle])
   (:import (java.io ByteArrayInputStream)
            (java.util.zip GZIPInputStream)
            (software.amazon.awssdk.core ResponseInputStream)
@@ -176,8 +177,8 @@
     (is (= (mapv event (range 9))
            (event-store/reduce-events s 0 conj []))
         "every event comes back, in order, decoded from the tar")
-    (is (= [4 4 4] @requests)
-        "nine events in batches of four: two full, then a short one that ends it")))
+    (is (= [4 4 1] @requests)
+        "nine events in batches of four, the last batch bounded by the head")))
 
 (deftest a-replay-can-start-anywhere-and-stop-early
   (let [objects (objects)
@@ -208,6 +209,26 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"Bundle returned an unexpected object"
                           (event-store/reduce-events s 0 conj [])))))
+
+(deftest headers-the-jdk-owns-are-not-copied-onto-the-request
+  ;; The signer returns Host because it is signed, and the JDK's HttpClient
+  ;; throws IllegalArgumentException rather than let a caller set it. The JDK
+  ;; derives an identical Host from the same URI, so dropping it is safe --
+  ;; but forgetting to drop it breaks every bundle request, and no test that
+  ;; stubs :bundle-request can see that.
+  (let [signed {"Host" ["events.t3.storage.dev"]
+                "Authorization" ["AWS4-HMAC-SHA256 ..."]
+                "x-amz-date" ["20260826T000000Z"]
+                "Content-Length" ["123"]}
+        extra {"X-Tigris-Consistent" "true"
+               "x-tigris-bundle-format" "tar"}
+        headers (into {} (bundle/settable-headers signed extra))]
+    (is (nil? (get headers "Host")))
+    (is (nil? (get headers "Content-Length")))
+    (is (= "AWS4-HMAC-SHA256 ..." (get headers "Authorization")))
+    (is (= "20260826T000000Z" (get headers "x-amz-date")))
+    (is (= "true" (get headers "X-Tigris-Consistent")))
+    (is (= "tar" (get headers "x-tigris-bundle-format")))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'simplemono.event-store.tigris-test)]
