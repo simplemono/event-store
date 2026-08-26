@@ -177,8 +177,71 @@
     (is (= (mapv event (range 9))
            (event-store/reduce-events s 0 conj []))
         "every event comes back, in order, decoded from the tar")
-    (is (= [4 4 1] @requests)
-        "nine events in batches of four, the last batch bounded by the head")))
+    (is (= [4 4] @requests)
+        "event 0 comes from the read that starts every replay, and the eight
+         after it in batches of four, bounded by the head")))
+
+(defn- counting-client
+  "Wraps a client and counts the two requests a replay can spend: the LIST that
+   finds the head, and the GET that reads one event."
+  [client lists gets]
+  (proxy [software.amazon.awssdk.services.s3.S3Client] []
+    (listObjectsV2 [request]
+      (swap! lists inc)
+      (.listObjectsV2 client request))
+    (getObject [& args]
+      (swap! gets inc)
+      (clojure.lang.Reflector/invokeInstanceMethod client "getObject"
+                                                   (into-array Object args)))
+    (headObject [request] (.headObject client request))
+    (putObject [request body] (.putObject client request body))
+    (close [] (.close client))
+    (serviceName [] (.serviceName client))))
+
+(deftest an-idle-replay-costs-one-get-and-no-list
+  ;; The hot path: a projection asking whether anything happened, when nothing
+  ;; has. One GET is Class B; a LIST is Class A and about ten times the price,
+  ;; and this used to spend two of them.
+  (let [objects (objects)
+        lists (atom 0)
+        gets (atom 0)
+        requests (atom [])
+        s (store objects
+                 {:client (counting-client (memory-client/client objects) lists gets)
+                  :bundle-request (fn [_store keys]
+                                    (swap! requests conj (count keys))
+                                    (memory-client/tar objects keys))})]
+    (append-range! s 0 4)
+    (reset! lists 0)
+    (reset! gets 0)
+    (reset! requests [])
+    (is (= [] (event-store/reduce-events s 4 conj [])))
+    (is (= 1 @gets) "the cheapest question is whether the next event exists")
+    (is (zero? @lists) "and it is answered without finding the head")
+    (is (= [] @requests) "no bundle either")))
+
+(deftest a-replay-that-finds-something-pays-for-the-head
+  (let [objects (objects)
+        lists (atom 0)
+        gets (atom 0)
+        s (store objects
+                 {:client (counting-client (memory-client/client objects) lists gets)})]
+    (append-range! s 0 6)
+    (reset! lists 0)
+    (reset! gets 0)
+    (is (= (mapv event (range 6)) (event-store/reduce-events s 0 conj [])))
+    (is (= 1 @gets) "one event read on its own, the rest in bundles")
+    (is (pos? @lists) "the LIST is spent where there is work to amortise it")))
+
+(deftest bundle-size-is-capped-below-the-tigris-maximum
+  ;; A bundle costs per key, not per request, so a bigger batch buys close to
+  ;; nothing while making everything that goes wrong with one bigger.
+  (is (= 1000 (:bundle-size (tigris/store {:bucket "events" :prefix "org/acme"})))
+      "the default sits below the 5000 Tigris accepts")
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                        #":bundle-size must be between 1 and the maximum"
+                        (tigris/store {:bucket "events" :prefix "org/acme"
+                                       :bundle-size 5000}))))
 
 (deftest a-replay-can-start-anywhere-and-stop-early
   (let [objects (objects)

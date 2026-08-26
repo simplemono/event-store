@@ -13,7 +13,7 @@
 
    Replaying does not read one object per event. Tigris can return many objects
    as one streaming tar — see `simplemono.event-store.tigris.bundle` — so
-   `reduce-events` costs one request per :bundle-size events, 5000 by default,
+   `reduce-events` costs one request per :bundle-size events, 1000 by default,
    plus one LIST for the head that bounds the last batch. Nothing is written to
    make that fast: there are no packs, nothing to build, nothing to keep
    current, and the first replay of a stream is as cheap as the tenth.
@@ -425,15 +425,31 @@
                            :got (:read retried)
                            :from (first keys)})))))))
 
-(defn- replay
+(def ^:private max-bundle-size
+  "The most events one replay request asks for.
+
+   Tigris accepts five times this (`bundle/max-keys`), but the cost of a bundle
+   is per key rather than per request: reading a thousand events takes about as
+   long in one request as in twenty. Larger batches therefore buy close to
+   nothing, while a smaller one bounds everything that goes wrong with a batch
+   — the keys in the request body, the archive held open, what a consistent
+   re-read costs, and how far past the end a mistake can reach."
+  1000)
+
+(defn- replay-from-head
   "Walk the stream in bundles, never asking for a key that cannot exist.
 
    The head bounds every batch. Asking for a full batch and letting Tigris skip
    what is missing would also work, and is how an earlier version found the end
-   of a stream — but it makes the last request of every replay ask for
-   thousands of absent objects, which is wasteful at best. One LIST for the
-   head is cheaper than that, costs nothing extra to read consistently, and is
-   re-read once at the end in case the stream grew while we were reading it."
+   of a stream. It is far worse than it looks: a key that is not there costs
+   about 7ms to discover, so a full batch past the end of a short stream takes
+   tens of seconds and answers with half a megabyte naming everything that was
+   absent. Setting `on-error` to fail rather than skip does not help — Tigris
+   resolves every key before it decides, and takes the same time to say no.
+
+   One LIST for the head is cheaper than any of that, costs nothing extra to
+   read consistently, and is re-read once at the end in case the stream grew
+   while we were reading it."
   [{:keys [prefix bundle-size] :as store} from f init]
   (loop [event-number (long from)
          acc init
@@ -456,6 +472,26 @@
         (if stopped?
           @acc
           (recur (+ event-number (long read)) acc latest))))))
+
+(defn- replay
+  "Read the first event on its own, and only then go looking for the head.
+
+   Whether the next event exists is the cheapest question there is, and the
+   answer is the event itself: one GET, which is Class B and is needed anyway.
+   It is also the whole of an idle replay — a projection asking whether
+   anything has happened when nothing has — which is the call that runs most
+   often and used to pay two LISTs, Class A and roughly ten times the price, to
+   be told no.
+
+   A replay that finds something goes on to spend the LIST, where there is work
+   to amortise it over."
+  [store from f init]
+  (if-some [event (event-object store from)]
+    (let [acc (f init event)]
+      (if (reduced? acc)
+        @acc
+        (replay-from-head store (inc (long from)) f acc)))
+    init))
 
 (defrecord TigrisEventStore [client bucket prefix headers endpoint region
                              credentials-provider http-client bundle-request
@@ -509,22 +545,22 @@
    - :bundle-request a fn of [store keys] returning a tar InputStream, for
                      tests; the real Tigris bundle request otherwise
    - :headers        extra request headers, merged over X-Tigris-Consistent
-   - :bundle-size    events per replay request, default and maximum 5000
+   - :bundle-size    events per replay request, default and maximum 1000
    - :on-retry       called with {:op :key :attempt :exception} before every
                      retry of a transient failure, defaults to printing a line
                      to *err*. An outage is otherwise indistinguishable from
                      slowness, so replace this with your own logging."
   [{:keys [bucket prefix access-key-id secret-access-key
            client bundle-request headers bundle-size on-retry]
-    :or {bundle-size bundle/max-keys}}]
+    :or {bundle-size max-bundle-size}}]
   (when (str/blank? (str bucket))
     (throw (ex-info "An event store requires :bucket" {:error :incorrect})))
   (when-not (and (pos-int? bundle-size)
-                 (<= bundle-size bundle/max-keys))
-    (throw (ex-info ":bundle-size must be between 1 and the Tigris maximum"
+                 (<= bundle-size max-bundle-size))
+    (throw (ex-info ":bundle-size must be between 1 and the maximum"
                     {:error :incorrect
                      :bundle-size bundle-size
-                     :maximum bundle/max-keys})))
+                     :maximum max-bundle-size})))
   (map->TigrisEventStore
    {:client (or client (simplemono.event-store.tigris/client
                         {:access-key-id access-key-id

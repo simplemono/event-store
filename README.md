@@ -130,8 +130,9 @@ the first event number that does not exist.
 
 **A replay does not read one object per event.** Tigris can return many objects
 as a single streaming tar — `POST /{bucket}?bundle` with a list of keys — so a
-replay costs **one request per `:bundle-size` events**, 5000 by default. For
-thirty million events that is six thousand requests instead of thirty million.
+replay costs **one request per `:bundle-size` events**, 1000 by default. For
+thirty million events that is thirty thousand requests instead of thirty
+million.
 
 Nothing is written to make this fast. There are no packs, no index, no
 compaction, nothing to keep current and nothing to rebuild after a schema
@@ -153,6 +154,38 @@ and the replay never asks for a key that cannot exist. And entry names are
 checked against the keys asked for: a gap-free stream cannot legitimately skip
 one, and a replay that quietly dropped an event would be worse than one that
 stopped.
+
+### The first event is read on its own
+
+Before any of that, a replay reads the event at `from` with a plain GET.
+
+Whether the next event exists is the cheapest question there is, and the answer
+is the event itself. It is also the whole of an idle replay — a projection
+asking whether anything has happened, when nothing has — which is the call that
+runs most often. That now costs **one GET and no LIST**: a GET is Class B, while
+a LIST is Class A and roughly ten times the price. Only a replay that finds
+something goes on to spend the LIST, where there is work to amortise it over.
+
+Measured against a real bucket, on a stream of a thousand events:
+
+| replay | LISTs | GETs | wall clock |
+| --- | --- | --- | --- |
+| idle | **0** | 1 | 66ms |
+| one event behind | 2 | 1 | 102ms |
+| all thousand | 2 | 1 | 1.8s |
+
+### Why not just ask for a full batch
+
+Letting Tigris skip what is missing, instead of bounding every batch by the
+head, would be simpler. It is far worse than it looks: a key that is not there
+costs about **7ms** to discover, flat and linear. A 5000-key batch past the end
+of a short stream takes **35 seconds** and answers with half a megabyte naming
+everything that was absent.
+
+Setting `x-tigris-bundle-on-error` to `fail` rather than `skip` does not help.
+Tigris resolves every key before it decides, so a failing request takes the
+same 35 seconds — it just returns `404 BundleKeyNotFound` at the end of it
+instead of an archive.
 
 `EventReplay` is an *optional* protocol. An implementation adopts it when its
 storage can read in bulk faster than one event at a time, the way a collection
@@ -218,8 +251,24 @@ default provider chain has them, and accepts:
 | `:client` | built from the credentials | an `S3Client`, if you would rather build it or hand in a double |
 | `:bundle-request` | the real bundle POST | a fn of `[store keys]` returning a tar `InputStream`, for tests |
 | `:headers` | `X-Tigris-Consistent: true` | extra request headers, merged over the default |
-| `:bundle-size` | `5000` | events per replay request; 5000 is the Tigris maximum |
+| `:bundle-size` | `1000` | events per replay request; also the maximum, see below |
 | `:on-retry` | prints to `*err*` | called with `{:op :key :attempt :exception}` before each retry |
+
+`:bundle-size` is capped at 1000 although Tigris accepts 5000, because a bundle
+costs per key rather than per request. Reading a thousand present events takes
+about as long in one request as in twenty:
+
+| batch | requests | total |
+| --- | --- | --- |
+| 1000 | 1 | 6 371ms |
+| 250 | 4 | 6 363ms |
+| 100 | 10 | 6 904ms |
+| 50 | 20 | 7 083ms |
+
+A larger batch therefore buys close to nothing, while a smaller one bounds
+everything that goes wrong with a batch: the keys in the request body, the
+archive held open, what a consistent re-read costs, and how far past the end a
+mistake can reach.
 
 ## Testing your own code
 
