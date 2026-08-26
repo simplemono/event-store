@@ -12,6 +12,8 @@
    which is not an S3 operation at all."
   (:require [clojure.string :as str])
   (:import (java.io ByteArrayInputStream ByteArrayOutputStream)
+           (org.apache.commons.compress.archivers.tar TarArchiveEntry
+                                                      TarArchiveOutputStream)
            (software.amazon.awssdk.core ResponseInputStream)
            (software.amazon.awssdk.core.sync RequestBody)
            (software.amazon.awssdk.services.s3 S3Client)
@@ -98,49 +100,25 @@
              (.isTruncated (boolean (> (count matching) (count contents))))
              (.build)))))))
 
-(def ^:private block-size 512)
-
-(defn- octal-field!
-  [^bytes block offset width n]
-  (let [s (str (format (str "%0" (dec (long width)) "o") (long n)) (char 0))]
-    (System/arraycopy (.getBytes s "UTF-8") 0 block offset (count s))))
-
-(defn- tar-header
-  [^String name size]
-  (let [block (byte-array block-size)
-        name-bytes (.getBytes name "UTF-8")]
-    (when (< 100 (alength name-bytes))
-      (throw (ex-info "Key too long for a plain tar header" {:name name})))
-    (System/arraycopy name-bytes 0 block 0 (alength name-bytes))
-    (octal-field! block 100 8 420)
-    (octal-field! block 108 8 0)
-    (octal-field! block 116 8 0)
-    (octal-field! block 124 12 size)
-    (octal-field! block 136 12 0)
-    (aset-byte block 156 (byte (int \0)))
-    (System/arraycopy (.getBytes "ustar 00" "UTF-8") 0 block 257 8)
-    ;; The checksum is computed with its own field read as spaces.
-    (java.util.Arrays/fill block 148 156 (byte (int \space)))
-    (octal-field! block 148 8 (reduce + (map #(bit-and (long %) 255) block)))
-    (aset-byte block 154 (byte 0))
-    (aset-byte block 155 (byte (int \space)))
-    block))
-
 (defn tar
   "A tar of the objects at `keys`, in that order, as an InputStream.
 
-   Mimics the Tigris bundle API closely enough to exercise a real tar reader:
-   entries are named by their full key, and a key with no object is left out,
-   the way `x-tigris-bundle-on-error: skip` behaves."
+   Mimics the Tigris bundle API closely enough to exercise a real tar reader.
+   A key with no object is left out, the way `x-tigris-bundle-on-error: skip`
+   behaves. Long-file mode is POSIX because that is what Tigris does: a key
+   that fits is a plain ustar entry and a longer one becomes a pax extended
+   header, so a reader that only understands ustar fails here as it would
+   there."
   [objects keys]
-  (let [out (ByteArrayOutputStream.)]
-    (doseq [key keys
-            :let [^bytes content (get @objects key)]
-            :when content]
-      (.write out ^bytes (tar-header key (alength content)))
-      (.write out content)
-      (let [padding (mod (- block-size (mod (alength content) block-size)) block-size)]
-        (when (pos? padding)
-          (.write out (byte-array padding)))))
-    (.write out (byte-array (* 2 block-size)))
-    (ByteArrayInputStream. (.toByteArray out))))
+  (let [bytes (ByteArrayOutputStream.)]
+    (with-open [out (TarArchiveOutputStream. bytes)]
+      (.setLongFileMode out TarArchiveOutputStream/LONGFILE_POSIX)
+      (doseq [key keys
+              :let [^bytes content (get @objects key)]
+              :when content]
+        (let [entry (TarArchiveEntry. ^String key)]
+          (.setSize entry (alength content))
+          (.putArchiveEntry out entry)
+          (.write out content)
+          (.closeArchiveEntry out))))
+    (ByteArrayInputStream. (.toByteArray bytes))))

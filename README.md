@@ -25,9 +25,9 @@ digits), so the newest object sorts first and finding the head is one LIST with
 | module | namespace | depends on |
 | --- | --- | --- |
 | `core` | `simplemono.event-store` — the `EventStore` and `EventReplay` protocols | nothing |
-| `tigris` | `simplemono.event-store.tigris` — the implementation | `core`, `awssdk/s3` |
+| `tigris` | `simplemono.event-store.tigris` — the implementation | `core`, `awssdk/s3`, `commons-compress` |
 | `memory` | `simplemono.event-store.memory` — an in-memory implementation | `core` |
-| `memory-client` | `simplemono.event-store.memory-client` — test doubles | `awssdk/s3` |
+| `memory-client` | `simplemono.event-store.memory-client` — test doubles | `awssdk/s3`, `commons-compress` |
 
 The protocol namespace has no dependencies of its own, so another
 implementation can satisfy it without pulling in the AWS SDK — `memory` is the
@@ -253,6 +253,12 @@ this library uses: an in-memory `S3Client`, and a `tar` function standing in for
 the bundle API. They are fakes of the transport, not of the store, so the suite
 exercises the real code — the same key encoding, inverted ordering, gzip,
 create-only put, retrying and tar parsing — with only the network missing.
+
+The fake writes its archives with Commons Compress in POSIX long-file mode, so
+a long key becomes a pax extended header there as it does on Tigris. It is not
+an exact mimic: it reaches for pax at 100 characters where Tigris keeps
+splitting into the ustar name prefix until 256, so the suite covers plain ustar
+and pax while Tigris's middle case needs a real bucket.
 
 Nothing depends on `memory-client` at runtime; it is a `:test` dependency.
 

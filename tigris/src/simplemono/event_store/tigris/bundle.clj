@@ -10,10 +10,12 @@
    machinery the SDK uses, then performed with the JDK's HTTP client so the
    response body can be streamed.
 
-   The JDK has no tar support, and a bundle needs very little of the format —
-   entries are read in order, sizes are known, and nothing is written — so the
-   reader here handles exactly the 512-byte header, the ustar name prefix and
-   the padding, and ignores everything else."
+   The archive is read with Apache Commons Compress rather than by hand. The
+   format is Tigris's to choose, and they do choose: a key that fits is a plain
+   ustar entry, a longer one is split into the ustar name prefix, and past the
+   256 characters ustar can hold they switch to a POSIX pax extended header.
+   A reader written against what we happened to observe would be a guess, and
+   that one has already been wrong once."
   (:require [clojure.string :as str])
   (:import (java.io InputStream)
            (java.net URI)
@@ -22,6 +24,7 @@
                           HttpResponse$BodyHandlers)
            (java.nio.charset StandardCharsets)
            (java.util.function Consumer)
+           (org.apache.commons.compress.archivers.tar TarArchiveInputStream)
            (software.amazon.awssdk.http ContentStreamProvider SdkHttpFullRequest
                                         SdkHttpMethod)
            (software.amazon.awssdk.http.auth.aws.signer AwsV4HttpSigner)))
@@ -30,68 +33,26 @@
   "The most keys Tigris accepts in one bundle request."
   5000)
 
-(def ^:private block-size 512)
-
-(defn- read-fully
-  "Fill `buf` from `in`. True when it was filled, false at a clean end of
-   stream, and throws when the stream ends part-way through a block."
-  [^InputStream in ^bytes buf]
-  (let [len (alength buf)]
+(defn- entry-bytes
+  "The whole of the current entry. Entries are one event each and small by
+   design, so reading one into memory is bounded by the size guidance rather
+   than by the archive."
+  [^TarArchiveInputStream tar size]
+  (let [buffer (byte-array size)]
     (loop [offset 0]
-      (if (= offset len)
-        true
-        (let [n (.read in buf offset (- len offset))]
+      (if (= offset size)
+        buffer
+        (let [n (.read tar buffer offset (- size offset))]
           (cond
-            (neg? n) (if (zero? offset)
-                       false
-                       (throw (ex-info "Truncated tar entry"
-                                       {:error :truncated-bundle
-                                        :expected len
-                                        :got offset})))
-            ;; A stream is allowed to hand back nothing without being at its
-            ;; end. Recurring on the same offset would spin here forever, so
-            ;; give up rather than hang.
+            (neg? n) (throw (ex-info "Truncated tar entry"
+                                     {:error :truncated-bundle
+                                      :expected size
+                                      :got offset}))
             (zero? n) (throw (ex-info "Bundle stream stalled"
                                       {:error :unavailable
-                                       :expected len
+                                       :expected size
                                        :got offset}))
             :else (recur (+ offset n))))))))
-
-(defn- trimmed
-  [^bytes block from len]
-  (let [end (loop [i from]
-              (if (or (= i (+ from len))
-                      (zero? (aget block i)))
-                i
-                (recur (inc i))))]
-    (String. block from (- end from) StandardCharsets/UTF_8)))
-
-(defn- octal
-  [^bytes block from len]
-  (let [s (str/trim (trimmed block from len))]
-    (if (str/blank? s)
-      0
-      (Long/parseLong s 8))))
-
-(defn- zero-block?
-  [^bytes block]
-  (every? zero? block))
-
-(defn- entry-name
-  "The full name of the entry: ustar splits long names into a prefix at 345 and
-   the remainder at 0."
-  [^bytes block]
-  (let [prefix (trimmed block 345 155)
-        name (trimmed block 0 100)]
-    (if (str/blank? prefix)
-      name
-      (str prefix "/" name))))
-
-(defn- skip-padding!
-  [^InputStream in size]
-  (let [padding (mod (- block-size (mod size block-size)) block-size)]
-    (when (pos? padding)
-      (read-fully in (byte-array padding)))))
 
 (defn reduce-tar
   "Reduce `f` over the entries of the tar in `in`, as [name bytes], in order.
@@ -99,21 +60,16 @@
    `f` may return `reduced` to stop, which leaves the stream part-read — the
    caller owns closing it. Returns the accumulator, deref'd."
   [^InputStream in f init]
-  (let [header (byte-array block-size)]
+  (let [tar (TarArchiveInputStream. in)]
     (loop [acc init]
       (if (reduced? acc)
         @acc
-        (if-not (read-fully in header)
-          acc
-          (if (zero-block? header)
-            acc
-            (let [name (entry-name header)
-                  size (octal header 124 12)
-                  content (byte-array size)]
-              (when (pos? size)
-                (read-fully in content))
-              (skip-padding! in size)
-              (recur (f acc [name content])))))))))
+        (if-some [entry (.getNextEntry tar)]
+          (if (.isFile entry)
+            (recur (f acc [(.getName entry)
+                           (entry-bytes tar (.getSize entry))]))
+            (recur acc))
+          acc)))))
 
 (defn- signed-headers
   "SigV4 headers for the bundle POST. The body is a key list we just built, so

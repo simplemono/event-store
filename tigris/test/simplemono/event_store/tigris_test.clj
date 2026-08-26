@@ -295,6 +295,28 @@
     (is (= [false] @seen)
         "`f` ending it is ordinary, so there is nothing to re-read")))
 
+(deftest keys-too-long-for-ustar-still-replay
+  ;; Tigris picks the tar dialect by key length: a key that fits is a plain
+  ;; ustar entry, a longer one is split into the ustar name prefix, and past
+  ;; the 256 characters ustar can hold it becomes a POSIX pax extended header.
+  ;; A hand-written reader that only knew ustar passed every test here and
+  ;; threw against the real service, which is why the reader is a library now.
+  ;;
+  ;; The double is not a perfect mimic: writing in POSIX long-file mode it
+  ;; reaches for pax at 100 characters, where Tigris keeps splitting into the
+  ;; ustar prefix until 256. So this covers plain ustar and pax, and Tigris's
+  ;; middle case is covered by the check against the real bucket.
+  (doseq [prefix-length [40 140 240 300]]
+    (let [objects (objects)
+          prefix (subs (apply str (repeat 20 "0123456789abcdef/")) 0 prefix-length)
+          s (store objects {:prefix prefix})
+          key-length (+ prefix-length (count "/events/") 19)]
+      (append-range! s 0 3)
+      (is (= (mapv event (range 3))
+             (event-store/reduce-events s 0 conj []))
+          (str "keys of " key-length " characters"))
+      (is (= (event 1) (event-store/get-event s 1))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'simplemono.event-store.tigris-test)]
     (when (pos? (+ fail error))
