@@ -1,24 +1,29 @@
-(ns simplemono.event-store.s3
-  "`simplemono.event-store/EventStore` on S3-compatible object storage.
+(ns simplemono.event-store.tigris
+  "`simplemono.event-store/EventStore` and `EventReplay` on Tigris.
 
-   One store is one stream. Everything it owns lives under one prefix:
+   One store is one stream, under one prefix in one bucket:
 
      {prefix}/events/{inverted-19d}   one gzip-EDN object per event
-     {prefix}/packs/{pack-size}/{inverted-19d}
-                                      one gzip-EDN vector per :pack-size events
 
-   Event numbers are zero-based and gap-free. `try-append!` is create-only:
-   it returns true when the event was written and false when another writer
+   Event numbers are zero-based and gap-free. `try-append!` is create-only: it
+   returns true when the event was written and false when another writer
    already took that number. The caller decides the number, which is normally
    its read-model cursor plus one, so a lost append means the state the caller
    decided on has moved and it should catch up and decide again.
 
+   Replaying does not read one object per event. Tigris can return many objects
+   as one streaming tar — see `simplemono.event-store.tigris.bundle` — so
+   `reduce-events` costs one request per :bundle-size events, 5000 by default.
+   Nothing is written to make that fast: there are no packs, nothing to build,
+   nothing to keep current, and the first replay of a stream is as cheap as the
+   tenth.
+
    Transient failures never reach the caller. Every request is retried, with
-   backoff, until the object store answers: a client-side exception, a 429 or a
-   5xx means try again, while a 4xx means the request itself is wrong and is
-   thrown at once, so a bad key or a missing bucket fails loudly instead of
-   hanging forever. Retries are announced through :on-retry, and the loop
-   sleeps, so interrupting the thread ends it.
+   backoff, until Tigris answers: a client-side exception, a 429 or a 5xx means
+   try again, while a 4xx means the request itself is wrong and is thrown at
+   once, so a bad key or a missing bucket fails loudly instead of hanging
+   forever. Retries are announced through :on-retry, and the loop sleeps, so
+   interrupting the thread ends it.
 
    Retrying an append is safe because the put is create-only. What a retry
    cannot see by itself is whether the attempt that failed had in fact landed:
@@ -27,25 +32,20 @@
    ours. That is why events must be EDN round-trippable, and why the caller
    never has to reason about an ambiguous append.
 
-   Packing is an implementation detail. Completing a range starts a background
-   thread that writes the packs, and `get-event` reads from a pack whenever one
-   covers the number. Event objects are never deleted, so a pack that is
-   missing, stale or corrupt only makes reads slower, never wrong. Packs are
-   namespaced by their size, so changing :pack-size on an existing stream
-   orphans the old packs and re-packs from scratch rather than corrupting
-   them.
-
    Object names use an inverted key-space (Long/MAX_VALUE - n, zero-padded to
    19 digits), so the newest object sorts first and the head is one LIST with
    maxKeys=1.
 
-   Events should stay small: :pack-size of them end up in one pack object.
-   Keep large payloads in a blob store and put the blob's name in the event."
+   This targets Tigris rather than S3 in general: the endpoint and the bundle
+   API are theirs, and X-Tigris-Consistent is sent by default so that a replay
+   sees events another machine wrote a moment ago."
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
-            [simplemono.event-store :as event-store])
-  (:import (java.io ByteArrayOutputStream)
+            [simplemono.event-store :as event-store]
+            [simplemono.event-store.tigris.bundle :as bundle])
+  (:import (java.io ByteArrayInputStream ByteArrayOutputStream)
            (java.net URI)
+           (java.net.http HttpClient)
            (java.nio.charset StandardCharsets)
            (java.util.function Consumer)
            (java.util.zip GZIPInputStream GZIPOutputStream)
@@ -95,18 +95,6 @@
 (defn- event-key
   [prefix event-number]
   (str (sub-prefix prefix "events") (format-number event-number)))
-
-(defn- packs-prefix
-  "Packs are namespaced by their size. Changing :pack-size therefore starts a
-   fresh set of packs instead of writing new-size packs at indices that already
-   mean something else: the old packs are orphaned rather than corrupt, are
-   never read again, and can be removed with one prefix delete."
-  [prefix pack-size]
-  (str (sub-prefix prefix "packs") pack-size "/"))
-
-(defn- pack-key
-  [prefix pack-size pack-index]
-  (str (packs-prefix prefix pack-size) (format-number pack-index)))
 
 (defn- key->number
   [prefix key]
@@ -301,91 +289,9 @@
   [{:keys [prefix] :as store}]
   (newest-number store (sub-prefix prefix "events")))
 
-(defn- newest-pack-index
-  [{:keys [prefix pack-size] :as store}]
-  (newest-number store (packs-prefix prefix pack-size)))
-
-(defn- packed-through
-  "The newest pack index this store knows about, or nil. Cached: event objects
-   are never deleted, so a stale cache only means a read falls back to the
-   individual object."
-  [{:keys [state] :as store}]
-  (let [cached @state]
-    (if (contains? cached :packed-through)
-      (:packed-through cached)
-      (let [index (newest-pack-index store)]
-        (swap! state assoc :packed-through index)
-        index))))
-
-(defn- read-pack
-  "The events of `pack-index`, or nil when the pack is absent or unusable."
-  [{:keys [prefix pack-size state] :as store} pack-index]
-  (or (when (= pack-index (:pack-index @state))
-        (:pack @state))
-      (let [events (get-edn store (pack-key prefix pack-size pack-index))]
-        (when (and (vector? events)
-                   (= pack-size (count events)))
-          (swap! state assoc :pack-index pack-index :pack events)
-          events))))
-
 (defn- event-object
   [{:keys [prefix] :as store} event-number]
   (get-edn store (event-key prefix event-number)))
-
-(defn- read-event
-  "The event at `event-number`, or nil when it does not exist. Served from a
-   pack when one covers the number, otherwise from the individual object."
-  [{:keys [pack-size] :as store} event-number]
-  (let [event-number (long event-number)
-        pack-index (quot event-number pack-size)]
-    (or (when-some [through (packed-through store)]
-          (when (<= pack-index through)
-            (some-> (read-pack store pack-index)
-                    (nth (mod event-number pack-size) nil))))
-        (event-object store event-number))))
-
-(defn- write-pack!
-  [{:keys [prefix pack-size] :as store} pack-index]
-  (let [from (* (long pack-index) pack-size)
-        events (mapv (fn [n]
-                       (or (event-object store n)
-                           (throw (ex-info "Cannot pack a range with a missing event"
-                                           {:error :missing-event
-                                            :event-number n
-                                            :pack-index pack-index}))))
-                     (range from (+ from pack-size)))]
-    (put! store
-          (pack-key prefix pack-size pack-index)
-          (gzip-bytes (pr-str events))
-          events)))
-
-(defn- pack-completed-ranges!
-  "Write every full pack that does not exist yet, oldest first. Packs are
-   written in ascending order and creation is create-only, so concurrent
-   packers are safe and an interrupted run resumes where it stopped."
-  [{:keys [pack-size state] :as store}]
-  (when-some [latest (head store)]
-    (let [full-packs (quot (inc (long latest)) pack-size)
-          start (if-some [through (newest-pack-index store)]
-                  (inc through)
-                  0)]
-      (doseq [pack-index (range start full-packs)]
-        (write-pack! store pack-index)
-        (swap! state assoc :packed-through pack-index)))))
-
-(defn- pack!
-  [{:keys [pack-async? on-pack-error] :as store}]
-  (let [run (fn []
-              (try
-                (pack-completed-ranges! store)
-                (catch Throwable t
-                  (on-pack-error t))))]
-    (if pack-async?
-      (doto (Thread. ^Runnable run "simplemono-event-store-pack")
-        (.setDaemon true)
-        (.start))
-      (run))
-    nil))
 
 (defn- append!
   "Create-only append of `event` at `event-number`.
@@ -393,7 +299,7 @@
    Checks the previous event with HEAD rather than listing the stream: LIST is
    a Class A operation on object stores such as Tigris while HEAD is Class B,
    roughly ten times cheaper."
-  [{:keys [prefix pack-size pack?] :as store} event-number event]
+  [{:keys [prefix] :as store} event-number event]
   (let [event-number (long event-number)]
     (when (neg? event-number)
       (throw (ex-info "Event numbers are zero-based"
@@ -401,15 +307,10 @@
                        :event-number event-number})))
     (if (or (zero? event-number)
             (object-exists? store (event-key prefix (dec event-number))))
-      (let [appended (put! store
-                           (event-key prefix event-number)
-                           (gzip-bytes (pr-str event))
-                           event)]
-        (when (and appended
-                   pack?
-                   (zero? (mod (inc event-number) pack-size)))
-          (pack! store))
-        appended)
+      (put! store
+            (event-key prefix event-number)
+            (gzip-bytes (pr-str event))
+            event)
       (gap! event-number))))
 
 (defn- print-retry
@@ -419,122 +320,184 @@
                   " failed (attempt " attempt "), retrying: "
                   (.getMessage exception)))))
 
-(defn- print-pack-error
-  [^Throwable t]
-  (binding [*out* *err*]
-    (println "simplemono.event-store.s3: packing failed:" (.getMessage t))
-    (.printStackTrace t)))
+(defn- bundle-keys
+  [prefix from size]
+  (mapv #(event-key prefix %) (range (long from) (+ (long from) (long size)))))
 
-(defrecord S3EventStore [client bucket prefix headers
-                         pack-size pack? pack-async? on-pack-error on-retry
-                         state]
+(defn- decode
+  [^bytes gzipped]
+  (with-open [gzip (GZIPInputStream. (ByteArrayInputStream. gzipped))]
+    (edn/read-string (slurp gzip :encoding "UTF-8"))))
+
+(defn- reduce-bundle
+  "Reduce `f` over the events at `keys`, in the order asked for. Returns
+   [acc read].
+
+   Tigris leaves a key with no object out of the archive, so `read` is how a
+   replay learns the stream ended: fewer entries than keys means there was
+   nothing more to fetch. Entry names are checked against the keys anyway,
+   because a gap-free stream cannot legitimately skip one, and a replay that
+   quietly dropped an event would be far worse than one that stopped."
+  [store keys f init]
+  (with-open [tar ((:bundle-request store) store keys)]
+    (let [result
+          (bundle/reduce-tar
+           tar
+           (fn [[acc read] [name ^bytes content]]
+             (if (= "__bundle_errors.json" name)
+               (reduced [acc read])
+               (let [expected (nth keys read nil)]
+                 (when-not (= expected name)
+                   (throw (ex-info "Bundle returned an unexpected object"
+                                   {:error :missing-event
+                                    :expected expected
+                                    :got name})))
+                 (let [acc (f acc (decode content))]
+                   (if (reduced? acc)
+                     (reduced [acc (inc (long read))])
+                     [acc (inc (long read))])))))
+           [init 0])]
+      result)))
+
+(defn- replay
+  [{:keys [prefix bundle-size] :as store} from f init]
+  (loop [event-number (long from)
+         acc init]
+    (if (reduced? acc)
+      @acc
+      (let [keys (bundle-keys prefix event-number bundle-size)
+            [acc read] (reduce-bundle store keys f acc)]
+        (if (< (long read) (count keys))
+          (if (reduced? acc) @acc acc)
+          (recur (+ event-number (long read)) acc))))))
+
+(defrecord TigrisEventStore [client bucket prefix headers endpoint region
+                             credentials-provider http-client bundle-request
+                             bundle-size on-retry]
   event-store/EventStore
   (try-append! [this event-number event]
     (append! this event-number event))
 
   (get-event [this event-number]
-    (read-event this event-number))
+    (event-object this event-number))
 
   (latest-event-number [this]
-    (head this)))
+    (head this))
+
+  event-store/EventReplay
+  (-reduce-events [this from f init]
+    (replay this from f init)))
+
+(def endpoint
+  "Tigris speaks S3 at one global endpoint."
+  "https://t3.storage.dev")
+
+(def region
+  "Tigris routes by itself; the region is only there for the signature."
+  "auto")
+
+(def consistent-header
+  "Route through the leader so that a read sees a write another machine made a
+   moment ago. A replay after a failover, or a projection catching up on a
+   second cell, depends on it."
+  {"X-Tigris-Consistent" "true"})
+
+(defn- credentials
+  [access-key-id secret-access-key]
+  (if access-key-id
+    (StaticCredentialsProvider/create
+     (AwsBasicCredentials/create access-key-id secret-access-key))
+    (DefaultCredentialsProvider/create)))
 
 (defn client
-  "An AWS SDK S3 client for an S3-compatible object store.
+  "An S3Client pointed at Tigris.
 
    Options:
-   - :endpoint            endpoint override, e.g. https://t3.storage.dev
-   - :region              defaults to us-east-1
    - :access-key-id       static credentials; omit to use the default provider
-   - :secret-access-key
-   - :path-style?         true for stores that need path-style URLs, e.g. MinIO"
-  [{:keys [endpoint region access-key-id secret-access-key path-style?]
-    :or {region "us-east-1"}}]
-  (let [builder (S3Client/builder)]
-    (.region builder (Region/of region))
-    (if access-key-id
-      (.credentialsProvider builder
-                            (StaticCredentialsProvider/create
-                             (AwsBasicCredentials/create access-key-id
-                                                         secret-access-key)))
-      (.credentialsProvider builder (DefaultCredentialsProvider/create)))
-    (when endpoint
-      (.endpointOverride builder (if (instance? URI endpoint)
-                                   endpoint
-                                   (URI/create (str endpoint)))))
-    (when (some? path-style?)
-      (.serviceConfiguration builder
-                             (reify Consumer
-                               (accept [_ config-builder]
-                                 (.pathStyleAccessEnabled config-builder
-                                                          (boolean path-style?))))))
-    (.build builder)))
+   - :secret-access-key"
+  [{:keys [access-key-id secret-access-key]}]
+  (-> (S3Client/builder)
+      (.region (Region/of region))
+      (.credentialsProvider (credentials access-key-id secret-access-key))
+      (.endpointOverride (URI/create endpoint))
+      (.build)))
 
 (defn store
   "An event store for one stream under `:prefix` in `:bucket`.
 
    Required:
-   - :client      an S3Client, e.g. from `client` or
-                  `simplemono.event-store.memory-client/client`
    - :bucket
-   - :prefix      the stream's prefix; events/ and packs/ are created under it
+   - :prefix               the stream's prefix; events/ is created under it
+   - :access-key-id        static credentials; omit to use the default provider
+   - :secret-access-key
 
    Optional:
-   - :headers        extra request headers, e.g. {\"X-Tigris-Consistent\" \"true\"}
-   - :pack-size      events per pack, default 1000
-   - :pack?          set false to never pack, default true
-   - :pack-async?    set false to pack on the appending thread, default true
-   - :on-pack-error  called with the Throwable when background packing fails,
-                     defaults to printing it to *err*
+   - :client         an S3Client, if you would rather build it yourself or hand
+                     in a test double; built from the credentials otherwise
+   - :bundle-request a fn of [store keys] returning a tar InputStream, for
+                     tests; the real Tigris bundle request otherwise
+   - :headers        extra request headers, merged over X-Tigris-Consistent
+   - :bundle-size    events per replay request, default and maximum 5000
    - :on-retry       called with {:op :key :attempt :exception} before every
                      retry of a transient failure, defaults to printing a line
                      to *err*. An outage is otherwise indistinguishable from
                      slowness, so replace this with your own logging."
-  [{:keys [client bucket prefix headers pack-size pack? pack-async?
-           on-pack-error on-retry]
-    :or {pack-size 1000
-         pack? true
-         pack-async? true}}]
-  (when-not client
-    (throw (ex-info "An event store requires :client" {:error :incorrect})))
+  [{:keys [bucket prefix access-key-id secret-access-key
+           client bundle-request headers bundle-size on-retry]
+    :or {bundle-size bundle/max-keys}}]
   (when (str/blank? (str bucket))
     (throw (ex-info "An event store requires :bucket" {:error :incorrect})))
-  (when-not (pos-int? pack-size)
-    (throw (ex-info ":pack-size must be a positive integer"
+  (when-not (and (pos-int? bundle-size)
+                 (<= bundle-size bundle/max-keys))
+    (throw (ex-info ":bundle-size must be between 1 and the Tigris maximum"
                     {:error :incorrect
-                     :pack-size pack-size})))
-  (->S3EventStore client
-                  bucket
-                  (normalize-prefix prefix)
-                  (or headers {})
-                  pack-size
-                  pack?
-                  pack-async?
-                  (or on-pack-error print-pack-error)
-                  (or on-retry print-retry)
-                  (atom {})))
+                     :bundle-size bundle-size
+                     :maximum bundle/max-keys})))
+  (map->TigrisEventStore
+   {:client (or client (simplemono.event-store.tigris/client
+                        {:access-key-id access-key-id
+                         :secret-access-key secret-access-key}))
+    :bucket bucket
+    :prefix (normalize-prefix prefix)
+    :headers (merge consistent-header headers)
+    :endpoint endpoint
+    :region region
+    ;; The provider, not resolved credentials: a store handed a :client and a
+    ;; :bundle-request never signs anything and must not demand them.
+    :credentials-provider (credentials access-key-id secret-access-key)
+    :http-client (HttpClient/newHttpClient)
+    :bundle-request (or bundle-request bundle/request!)
+    :bundle-size bundle-size
+    :on-retry (or on-retry print-retry)}))
 
 (comment
 
   (require '[simplemono.event-store.memory-client :as memory-client])
 
-  (def s (store {:client (memory-client/client)
-                 :bucket "events"
+  ;; Offline: a fake S3Client, and a bundle built from the same objects.
+  (def objects (atom (sorted-map)))
+
+  (def s (store {:bucket "events"
                  :prefix "org/acme"
-                 :pack-size 4
-                 :pack-async? false}))
+                 :client (memory-client/client objects)
+                 :bundle-request (fn [_store keys]
+                                   (memory-client/tar objects keys))
+                 :bundle-size 4}))
 
-  (event-store/latest-event-number s)
-
-  (event-store/try-append! s 0 {:event/type :example/created})
-  (event-store/try-append! s 0 {:event/type :example/created})
-
-  (event-store/get-event s 0)
-
-  ;; Append until the first pack is complete, then read through it:
-  (doseq [n (range 1 8)]
-    (event-store/try-append! s n {:event/type :example/updated :n n}))
+  (doseq [n (range 9)]
+    (event-store/try-append! s n {:event/type :example/happened :n n}))
 
   (event-store/latest-event-number s)
   (event-store/get-event s 3)
+  (event-store/reduce-events s 0 conj [])
+
+  ;; Against a real bucket:
+  (def real (store {:bucket "dev-<uuid>"
+                    :prefix "org/acme"
+                    :access-key-id (System/getenv "EVENT_STORE_ACCESS_KEY_ID")
+                    :secret-access-key (System/getenv "EVENT_STORE_SECRET_ACCESS_KEY")}))
+
+  (event-store/try-append! real 0 {:event/type :example/happened})
+  (event-store/reduce-events real 0 conj [])
 
   )

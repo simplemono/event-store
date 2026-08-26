@@ -1,9 +1,8 @@
-(ns simplemono.event-store.s3-test
-  (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is run-tests testing]]
+(ns simplemono.event-store.tigris-test
+  (:require [clojure.test :refer [deftest is run-tests testing]]
             [simplemono.event-store :as event-store]
             [simplemono.event-store.memory-client :as memory-client]
-            [simplemono.event-store.s3 :as s3])
+            [simplemono.event-store.tigris :as tigris])
   (:import (java.io ByteArrayInputStream)
            (java.util.zip GZIPInputStream)
            (software.amazon.awssdk.core ResponseInputStream)
@@ -35,13 +34,12 @@
 (defn- store
   ([objects] (store objects {}))
   ([objects overrides]
-   (s3/store
+   (tigris/store
     (merge {:client (memory-client/client objects)
             :bucket "events"
             :prefix "org/acme"
-            ;; Tests pack on the appending thread, so an append that completes
-            ;; a range has finished packing when it returns.
-            :pack-async? false}
+            :bundle-request (fn [_store keys] (memory-client/tar objects keys))
+            :bundle-size 4}
            overrides))))
 
 (defn- gunzip
@@ -87,76 +85,6 @@
     (is (= (pr-str (event 0))
            (gunzip (get @objects "org/acme/events/9223372036854775807"))))))
 
-(deftest completing-a-range-writes-a-pack
-  (let [objects (objects)
-        s (store objects {:pack-size 4})]
-    (append-range! s 0 3)
-    (is (empty? (filter #(str/starts-with? % "org/acme/packs/") (keys @objects)))
-        "a partial range is not packed")
-    (event-store/try-append! s 3 (event 3))
-    (is (= ["org/acme/packs/4/9223372036854775807"]
-           (filter #(str/starts-with? % "org/acme/packs/") (keys @objects))))
-    (is (= (pr-str (mapv event (range 4)))
-           (gunzip (get @objects "org/acme/packs/4/9223372036854775807"))))
-    (testing "the tail beyond the pack still reads from its own object"
-      (event-store/try-append! s 4 (event 4))
-      (is (= (event 4) (event-store/get-event s 4))))
-    (testing "the packed events are read through the pack, not their objects"
-      ;; Deleting the packed event objects is only safe because this test is
-      ;; finished with them; the real store never deletes an event.
-      (doseq [n (range 4)]
-        (swap! objects dissoc (str "org/acme/events/" (- Long/MAX_VALUE n))))
-      (let [reader (store objects {:pack-size 4})]
-        (is (= (mapv event (range 4))
-               (mapv #(event-store/get-event reader %) (range 4))))))))
-
-(deftest packing-catches-up-ranges-it-missed
-  (let [objects (objects)
-        ;; Nothing is packed while :pack? is false, so the second store starts
-        ;; with several complete ranges and no packs at all.
-        unpacked (store objects {:pack-size 4 :pack? false})]
-    (append-range! unpacked 0 11)
-    (is (empty? (filter #(str/starts-with? % "org/acme/packs/") (keys @objects))))
-    (let [s (store objects {:pack-size 4})]
-      (event-store/try-append! s 11 (event 11))
-      (is (= ["org/acme/packs/4/9223372036854775805"
-              "org/acme/packs/4/9223372036854775806"
-              "org/acme/packs/4/9223372036854775807"]
-             (filter #(str/starts-with? % "org/acme/packs/") (keys @objects)))
-          "one boundary packs every full range below the head, oldest first"))))
-
-(deftest a-missing-pack-only-slows-reads-down
-  (let [objects (objects)
-        s (store objects {:pack-size 4})]
-    (append-range! s 0 8)
-    (is (= 2 (count (filter #(str/starts-with? % "org/acme/packs/") (keys @objects)))))
-    (swap! objects dissoc "org/acme/packs/4/9223372036854775807")
-    (testing "a fresh store falls back to the individual event objects"
-      (let [reader (store objects {:pack-size 4})]
-        (is (= (mapv event (range 8))
-               (mapv #(event-store/get-event reader %) (range 8))))))))
-
-(deftest changing-the-pack-size-orphans-the-old-packs
-  (let [objects (objects)
-        small (store objects {:pack-size 4})]
-    (append-range! small 0 8)
-    (is (= 2 (count (filter #(str/starts-with? % "org/acme/packs/4/") (keys @objects)))))
-    (testing "a store with another size packs into its own namespace"
-      (let [large (store objects {:pack-size 8})]
-        (append-range! large 8 16)
-        (is (= ["org/acme/packs/8/9223372036854775806"
-                "org/acme/packs/8/9223372036854775807"]
-               (filter #(str/starts-with? % "org/acme/packs/8/") (keys @objects)))
-            "packing keeps working, and re-packs from event 0 under the new size")
-        (is (= 2 (count (filter #(str/starts-with? % "org/acme/packs/4/") (keys @objects))))
-            "the old packs are untouched, just orphaned")
-        (testing "and every event still reads correctly under either size"
-          (is (= (mapv event (range 16))
-                 (mapv #(event-store/get-event large %) (range 16))))
-          (is (= (mapv event (range 16))
-                 (mapv #(event-store/get-event (store objects {:pack-size 4}) %)
-                       (range 16)))))))))
-
 (defn- failing-put-client
   "Delegates to a memory client, but the first `failures` putObject calls throw
    the way a connection reset does — after storing the object or without
@@ -187,10 +115,9 @@
   (testing "a put that fails twice and then succeeds still appends"
     (let [objs (objects)
           retries (atom [])
-          s (s3/store {:client (failing-put-client objs 2 false)
+          s (tigris/store {:client (failing-put-client objs 2 false)
                        :bucket "events"
                        :prefix "org/acme"
-                       :pack-async? false
                        :on-retry #(swap! retries conj (:op %))})]
       (is (true? (event-store/try-append! s 0 (event 0))))
       (is (= [:put :put] @retries) "the caller sees no failure, only the result")
@@ -198,10 +125,9 @@
 
   (testing "a put that landed before it failed is recognised as ours"
     (let [objs (objects)
-          s (s3/store {:client (failing-put-client objs 1 true)
+          s (tigris/store {:client (failing-put-client objs 1 true)
                        :bucket "events"
                        :prefix "org/acme"
-                       :pack-async? false
                        :on-retry (constantly nil)})]
       ;; The first attempt stores the object and then throws, so the retry
       ;; finds the key taken. Reading it back shows the write was ours.
@@ -211,10 +137,9 @@
     (let [objs (objects)
           winner (store objs)]
       (is (true? (event-store/try-append! winner 0 (event 99))))
-      (let [s (s3/store {:client (failing-put-client objs 1 false)
+      (let [s (tigris/store {:client (failing-put-client objs 1 false)
                          :bucket "events"
                          :prefix "org/acme"
-                         :pack-async? false
                          :on-retry (constantly nil)})]
         (is (false? (event-store/try-append! s 0 (event 0))))
         (is (= (event 99) (event-store/get-event s 0)))))))
@@ -226,25 +151,13 @@
                  (^PutObjectResponse putObject [_ ^PutObjectRequest _request ^RequestBody _body]
                    (swap! attempts inc)
                    (throw forbidden)))
-        s (s3/store {:client client
+        s (tigris/store {:client client
                      :bucket "events"
                      :prefix "org/acme"
-                     :pack-async? false
                      :on-retry (constantly nil)})]
     (is (thrown? S3Exception (event-store/try-append! s 0 (event 0))))
     (is (= 1 @attempts)
         "a bad key or a missing bucket must fail loudly, not retry forever")))
-
-(deftest background-packing-completes
-  (let [objects (objects)
-        s (store objects {:pack-size 4 :pack-async? true})]
-    (append-range! s 0 4)
-    (let [deadline (+ (System/currentTimeMillis) 5000)]
-      (while (and (empty? (filter #(str/starts-with? % "org/acme/packs/") (keys @objects)))
-                  (< (System/currentTimeMillis) deadline))
-        (Thread/sleep 10)))
-    (is (= ["org/acme/packs/4/9223372036854775807"]
-           (filter #(str/starts-with? % "org/acme/packs/") (keys @objects))))))
 
 (deftest a-blank-prefix-puts-events-at-the-bucket-root
   (let [objects (objects)
@@ -252,7 +165,51 @@
     (is (true? (event-store/try-append! s 0 (event 0))))
     (is (= ["events/9223372036854775807"] (keys @objects)))))
 
+(deftest replaying-fetches-events-in-bundles
+  (let [objects (objects)
+        requests (atom [])
+        s (store objects {:bundle-request (fn [_store keys]
+                                            (swap! requests conj (count keys))
+                                            (memory-client/tar objects keys))})]
+    (append-range! s 0 9)
+    (reset! requests [])
+    (is (= (mapv event (range 9))
+           (event-store/reduce-events s 0 conj []))
+        "every event comes back, in order, decoded from the tar")
+    (is (= [4 4 4] @requests)
+        "nine events in batches of four: two full, then a short one that ends it")))
+
+(deftest a-replay-can-start-anywhere-and-stop-early
+  (let [objects (objects)
+        s (store objects)]
+    (append-range! s 0 9)
+    (is (= (mapv event (range 5 9))
+           (event-store/reduce-events s 5 conj [])))
+    (is (= [] (event-store/reduce-events s 9 conj [])))
+    (testing "reduced stops the replay"
+      (is (= (mapv event (range 2))
+             (event-store/reduce-events s 0
+                                        (fn [acc e]
+                                          (if (= 2 (count acc))
+                                            (reduced acc)
+                                            (conj acc e)))
+                                        []))))))
+
+(deftest an-empty-stream-replays-to-init
+  (is (= :nothing (event-store/reduce-events (store (objects)) 0 conj :nothing))))
+
+(deftest a-bundle-that-skips-an-event-is-reported
+  (let [objects (objects)
+        s (store objects)]
+    (append-range! s 0 8)
+    ;; A gap-free stream cannot legitimately be missing an event, so a bundle
+    ;; that silently leaves one out must stop the replay rather than drop it.
+    (swap! objects dissoc "org/acme/events/9223372036854775805")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"Bundle returned an unexpected object"
+                          (event-store/reduce-events s 0 conj [])))))
+
 (defn -main [& _]
-  (let [{:keys [fail error]} (run-tests 'simplemono.event-store.s3-test)]
+  (let [{:keys [fail error]} (run-tests 'simplemono.event-store.tigris-test)]
     (when (pos? (+ fail error))
       (System/exit 1))))

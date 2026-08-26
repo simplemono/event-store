@@ -3,12 +3,13 @@
 
    It is a fake transport rather than a second storage backend, so a test runs
    the real `simplemono.event-store` code: the same key encoding, the same
-   inverted ordering, the same gzip, the same create-only put and the same
-   packing. Only the network is missing.
+   inverted ordering, the same gzip, the same create-only put and the same tar
+   parsing. Only the network is missing.
 
    It implements exactly the four operations the event store performs —
    putObject with If-None-Match, getObject, headObject and a prefix listing
-   with maxKeys — and nothing else."
+   with maxKeys — and nothing else. `tar` stands in for the Tigris bundle API,
+   which is not an S3 operation at all."
   (:require [clojure.string :as str])
   (:import (java.io ByteArrayInputStream ByteArrayOutputStream)
            (software.amazon.awssdk.core ResponseInputStream)
@@ -96,3 +97,50 @@
              (.contents contents)
              (.isTruncated (boolean (> (count matching) (count contents))))
              (.build)))))))
+
+(def ^:private block-size 512)
+
+(defn- octal-field!
+  [^bytes block offset width n]
+  (let [s (str (format (str "%0" (dec (long width)) "o") (long n)) (char 0))]
+    (System/arraycopy (.getBytes s "UTF-8") 0 block offset (count s))))
+
+(defn- tar-header
+  [^String name size]
+  (let [block (byte-array block-size)
+        name-bytes (.getBytes name "UTF-8")]
+    (when (< 100 (alength name-bytes))
+      (throw (ex-info "Key too long for a plain tar header" {:name name})))
+    (System/arraycopy name-bytes 0 block 0 (alength name-bytes))
+    (octal-field! block 100 8 420)
+    (octal-field! block 108 8 0)
+    (octal-field! block 116 8 0)
+    (octal-field! block 124 12 size)
+    (octal-field! block 136 12 0)
+    (aset-byte block 156 (byte (int \0)))
+    (System/arraycopy (.getBytes "ustar 00" "UTF-8") 0 block 257 8)
+    ;; The checksum is computed with its own field read as spaces.
+    (java.util.Arrays/fill block 148 156 (byte (int \space)))
+    (octal-field! block 148 8 (reduce + (map #(bit-and (long %) 255) block)))
+    (aset-byte block 154 (byte 0))
+    (aset-byte block 155 (byte (int \space)))
+    block))
+
+(defn tar
+  "A tar of the objects at `keys`, in that order, as an InputStream.
+
+   Mimics the Tigris bundle API closely enough to exercise a real tar reader:
+   entries are named by their full key, and a key with no object is left out,
+   the way `x-tigris-bundle-on-error: skip` behaves."
+  [objects keys]
+  (let [out (ByteArrayOutputStream.)]
+    (doseq [key keys
+            :let [^bytes content (get @objects key)]
+            :when content]
+      (.write out ^bytes (tar-header key (alength content)))
+      (.write out content)
+      (let [padding (mod (- block-size (mod (alength content) block-size)) block-size)]
+        (when (pos? padding)
+          (.write out (byte-array padding)))))
+    (.write out (byte-array (* 2 block-size)))
+    (ByteArrayInputStream. (.toByteArray out))))

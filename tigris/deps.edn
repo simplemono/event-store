@@ -4,4 +4,5 @@
         software.amazon.awssdk/s3 {:mvn/version "2.25.64"}}
  :aliases
  {:test {:extra-paths ["test"]
-         :main-opts ["-m" "simplemono.event-store.s3-test"]}}}
+         :extra-deps {simplemono/event-store-memory-client {:local/root "../memory-client"}}
+         :main-opts ["-m" "simplemono.event-store.tigris-test"]}}}
