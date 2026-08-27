@@ -13,24 +13,26 @@
 
    Reading a range does not cost one request per event. Tigris can return many
    objects as one streaming tar — see `simplemono.event-store.tigris.bundle` —
-   and `events` walks a stream in batches that start at one and double to a
-   hundred. An idle replay costs a single request, reading one event by number
-   costs the same, and a long one is bundling within a handful. Nothing is
-   written to make that fast: there are no packs, nothing to build, nothing to
-   keep current, and the first replay of a stream is as cheap as the tenth.
+   so `events` reads a stream in batches of up to a hundred. Nothing is written
+   to make that fast: there are no packs, nothing to build, nothing to keep
+   current, and the first replay of a stream is as cheap as the tenth.
 
-   No replay spends a LIST. A batch capped at a hundred can run off the end of
-   the stream for less than a second, which is cheaper than asking where the
-   end was.
+   A replay opens with one key, spends one LIST on the head only once it has
+   found something to read, and then reads up to that head in batches. An idle
+   replay stops on the opening key, so it costs one request and no LIST, and
+   reading a single event by number costs the same.
 
-   Every request but the bundle is routed through the leader with
-   X-Tigris-Consistent, so a replay on one machine sees what another wrote a
-   moment ago. The bundle is not: it costs about five times the latency there,
-   and event objects are immutable and create-only, so an eventually consistent
-   read can only be missing an object, never showing an old version of one. A
-   batch that comes back short for a reason the reducing function did not cause
-   is read again through the leader, and fails loudly if it is still short —
-   so the cheap path is taken every time and paid for only when it is wrong.
+   Which reads go through the leader with X-Tigris-Consistent is measured
+   rather than chosen. A key that is there costs about 1ms relaxed and 6ms
+   through the leader, while a key that is *not* there costs about 250ms
+   relaxed and 9ms. So single keys, whose whole purpose is to find out whether
+   something exists, go through the leader; batches, whose keys the head has
+   already promised, do not. Appends and the head LIST go through the leader
+   too, because a stale answer there is indistinguishable from a real one.
+
+   A batch that comes back short is a replica that has not caught up. The keys
+   it missed are asked of the leader, and if they are still not there the
+   replay throws rather than ending quietly, because the head promised them.
 
    Transient failures never reach the caller. Every request is retried, with
    backoff, until Tigris answers: a client-side exception, a 429 or a 5xx means
@@ -155,6 +157,10 @@
    configuration error turns into a silent hang."
   [t]
   (or (instance? SdkClientException t)
+      ;; The bundle goes out over the JDK's HTTP client rather than the SDK, so
+      ;; its network failures arrive as IOException and its 5xx as an ex-info.
+      (instance? java.io.IOException t)
+      (= :unavailable (:error (ex-data t)))
       (and (instance? S3Exception t)
            (let [status (.statusCode ^S3Exception t)]
              (or (= 429 status)
@@ -377,7 +383,11 @@
    legitimately skip one and a replay that quietly dropped an event would be
    far worse than one that stopped."
   [store keys f init]
-  (with-open [tar ((:bundle-request store) store keys)]
+  ;; Only getting hold of the archive is retried. Once entries start reaching
+  ;; `f` a retry would hand it the same events twice, so a failure mid-stream
+  ;; propagates and the caller resumes from whatever cursor it committed.
+  (with-open [tar (with-retry store :bundle (first keys)
+                    #((:bundle-request store) store keys))]
     (bundle/reduce-tar
      tar
      (fn [{:keys [acc read] :as state} [name ^bytes content]]
@@ -440,10 +450,19 @@
             (= 1 (count keys)))
       cheap
       (let [rest-keys (vec (drop read keys))
-            {:keys [acc read stopped?]} (reduce-bundle (consistent store) rest-keys f acc)]
-        {:acc acc
-         :read (+ (long (:read cheap)) (long read))
-         :stopped? stopped?}))))
+            {:keys [acc read stopped?]} (reduce-bundle (consistent store) rest-keys f acc)
+            total (+ (long (:read cheap)) (long read))]
+        (when-not (or stopped? (= total (count keys)))
+          ;; Every key here was promised by a consistent LIST of the head, and
+          ;; the leader has now been asked directly. There is no innocent
+          ;; reading left: the events are gone. Returning the short count would
+          ;; end the replay quietly and lose everything after the hole.
+          (throw (ex-info "The stream is missing events the head promised"
+                          {:error :missing-event
+                           :expected (count keys)
+                           :got total
+                           :from (first keys)})))
+        {:acc acc :read total :stopped? stopped?}))))
 
 (def ^:private max-batch-size
   "The most events one request asks for.
@@ -592,8 +611,7 @@
                  :prefix "org/acme"
                  :client (memory-client/client objects)
                  :bundle-request (fn [_store keys]
-                                   (memory-client/tar objects keys))
-                 :bundle-size 4}))
+                                   (memory-client/tar objects keys))}))
 
   (doseq [n (range 9)]
     (event-store/try-append! s n {:event/type :example/happened :n n}))
@@ -777,7 +795,7 @@
                                      :payload (apply str (repeat 200 "x"))})))
 
   (time (reduce (fn [n _] (inc (long n))) 0 (event-store/events big 0)))
-  ;;=> batches of 1, 2, 4 ... 100, and no LIST anywhere
+  ;;=> one key, one LIST, then batches of a hundred, then the key past the end
 
   ;; The Tigris console shows what each cost, and which class a bundle
   ;; request bills as.

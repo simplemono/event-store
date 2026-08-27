@@ -283,22 +283,26 @@
                           #"Bundle returned an unexpected object"
                           (into [] (event-store/events s 0))))))
 
-(deftest a-hole-at-a-batch-boundary-reads-as-the-end-of-the-stream
-  ;; The honest limit of a bundle that skips what it cannot find. Batches end
-  ;; at the head or at the size cap, and a hole on that last key looks exactly
-  ;; like running into the end of the stream, even after the leader confirms
-  ;; it. Every other hole is caught by the name check, because the events after
-  ;; it arrive where it should have been.
+(deftest a-hole-the-head-promised-is-not-mistaken-for-the-end
+  ;; A batch is bounded by a consistently read head, so every key in it was
+  ;; promised to exist. A hole on the batch's last key is the one the entry
+  ;; names cannot catch, because nothing arrives after it to give it away.
+  ;; Asking the leader directly is the last innocent explanation, and once that
+  ;; comes back short too the events are simply gone.
   ;;
-  ;; Nothing ever deletes an event, so this means corruption rather than a
-  ;; race, and the replay reports fewer events instead of failing.
+  ;; Ending the replay there would return a hundred events and lose the twenty
+  ;; after the hole, looking exactly like a correct short read.
   (let [objects (objects)
         s (store objects)]
     (append-range! s 0 120)
-    ;; The first full batch runs 1 to 100. Losing its last key ends the replay
-    ;; there, twenty events early, with no complaint.
     (swap! objects dissoc (str "org/acme/events/" (- Long/MAX_VALUE 100)))
-    (is (= (mapv event (range 100)) (into [] (event-store/events s 0))))))
+    (let [t (try (count (into [] (event-store/events s 0)))
+                 (catch clojure.lang.ExceptionInfo t t))]
+      (is (instance? clojure.lang.ExceptionInfo t)
+          "the replay fails rather than returning a hundred events")
+      (is (= :missing-event (:error (ex-data t))))
+      (is (= [99 100] [(:got (ex-data t)) (:expected (ex-data t))])
+          "and says how much of the batch arrived against what was asked"))))
 
 (deftest headers-the-jdk-owns-are-not-copied-onto-the-request
   ;; The signer returns Host because it is signed, and the JDK's HttpClient

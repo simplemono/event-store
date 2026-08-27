@@ -145,7 +145,9 @@ request, no LIST.
 
 **One LIST for the head**, and only once there is something to read. It is a
 Class A operation, about ten times the price of a read, and it earns that by
-bounding every batch that follows.
+bounding every batch that follows: every key in them is then promised to exist,
+so a batch that stays short after the leader has been asked means the events are
+gone, and the replay throws instead of ending quietly.
 
 **Batches up to the head, relaxed.** Every key in them is known to be there.
 Passing the head, one more key is asked of the leader, which ends the replay
@@ -180,10 +182,15 @@ the whole batch would hand the reducing function the same events twice, which
 `into` and `transduce` would not undo, because they use transients.
 
 Entry names are checked against the keys asked for. A gap-free stream cannot
-legitimately skip one, so an event arriving where another was expected stops
-the replay. The exception is a missing key at the *end* of a batch, which
-cannot be told from the end of the stream. Nothing ever deletes an event, so
-that means corruption rather than a race.
+legitimately skip one, so an event arriving where another was expected stops the
+replay. A missing key at the *end* of a batch has nothing after it to give it
+away, so that one is caught by the count instead: the batch was bounded by the
+head, so a short count the leader confirms means the events are gone. Nothing
+ever deletes an event, so that is corruption rather than a race, and it throws.
+
+Only the opening single key may legitimately come back empty. That is not
+bounded by anything, and an empty answer is how a replay learns the stream ends
+there.
 
 ### Measured
 
