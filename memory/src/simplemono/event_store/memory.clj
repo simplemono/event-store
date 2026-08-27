@@ -12,7 +12,8 @@
    create-only, gap-free behaviour an object store gives them. Unlike a store
    reached over a network, an append here either happened or threw, so there is
    never an uncertain write to resolve."
-  (:require [simplemono.event-store :as event-store]))
+  (:require [simplemono.event-store :as event-store]
+            [simplemono.event-store.util :as util]))
 
 (defn- gap!
   [event-number expected]
@@ -54,7 +55,7 @@
   (events [_ from]
     ;; Reading one event from a map costs what reading a hundred does, so the
     ;; generic walk is also the fastest one available here.
-    (event-store/one-at-a-time #(get @state (long %)) from)))
+    (util/one-at-a-time #(get @state (long %)) from)))
 
 (defn latest-event-number
   "The highest event number in the stream, or nil when it is empty."

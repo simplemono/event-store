@@ -56,6 +56,7 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [simplemono.event-store :as event-store]
+            [simplemono.event-store.util :as util]
             [simplemono.event-store.tigris.bundle :as bundle])
   (:import (java.io ByteArrayInputStream ByteArrayOutputStream)
            (java.net URI)
@@ -514,7 +515,7 @@
 
   event-store/EventSource
   (events [this from]
-    (event-store/reducible
+    (util/reducible
      (fn [rf init]
        (replay this from rf init)))))
 

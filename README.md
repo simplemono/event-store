@@ -279,8 +279,8 @@ Pass your own atom over a sorted map to `memory/store` to seed a stream or to
 inspect one. Appends are serialised, so concurrent writers see the same
 create-only, gap-free behaviour Tigris gives them. Reading one event from a map
 costs what reading a hundred does, so `events` there is the generic walk in
-`simplemono.event-store/one-at-a-time`, which any implementation can use in a
-line.
+`simplemono.event-store.util/one-at-a-time`, which any implementation can use in
+a line.
 
 What it cannot reproduce is a network: there is no retrying and no uncertain
 write, because an append here either happened or threw.

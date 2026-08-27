@@ -1,7 +1,8 @@
 (ns simplemono.event-store.memory-test
   (:require [clojure.test :refer [deftest is run-tests testing]]
             [simplemono.event-store :as event-store]
-            [simplemono.event-store.memory :as memory]))
+            [simplemono.event-store.memory :as memory]
+            [simplemono.event-store.util :as util]))
 
 (defn- event
   [n]
@@ -78,7 +79,7 @@
   (let [called (atom 0)
         bulk (reify event-store/EventSource
                (events [_ from]
-                 (event-store/reducible
+                 (util/reducible
                   (fn [rf init]
                     (swap! called inc)
                     (reduce rf init (map event (range from 2)))))))]

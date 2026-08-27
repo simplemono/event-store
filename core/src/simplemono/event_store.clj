@@ -13,11 +13,14 @@
    stream are separate jobs. A projection can be handed something that only
    reads and cannot append by mistake.
 
+   This namespace holds the protocols and nothing else.
+   `simplemono.event-store.util` has the helpers an implementation of `events`
+   would otherwise repeat.
+
    Command handling, projections, retries and idempotency live in the
    application. The usual loop is to catch a read model up, decide against it,
    and append at the cursor plus one; a false return means the state the
-   decision rested on has moved, so the caller catches up and decides again."
-  (:import (clojure.lang IReduceInit)))
+   decision rested on has moved, so the caller catches up and decides again.")
 
 (defprotocol EventAppend
   (try-append! [store event-number event]
@@ -59,29 +62,3 @@
 
      How the events are fetched is the store's business, because only the store
      knows what a request costs."))
-
-(defn reducible
-  "Wraps `f`, a function of a reducing function and an initial value, as
-   something `reduce` accepts. For implementing `events` without repeating the
-   interop."
-  [f]
-  (reify IReduceInit
-    (reduce [_ rf init]
-      (f rf init))))
-
-(defn one-at-a-time
-  "An `events` implementation for storage with no bulk read.
-
-   Fetches events one by one with `read-event`, a function of an event number
-   returning the event or nil. Correct anywhere, and the right thing where
-   reading a hundred events costs what reading one does."
-  [read-event from]
-  (reducible
-   (fn [rf init]
-     (loop [event-number (long from)
-            acc init]
-       (if (reduced? acc)
-         @acc
-         (if-some [event (read-event event-number)]
-           (recur (inc event-number) (rf acc event))
-           acc))))))
