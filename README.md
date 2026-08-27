@@ -2,10 +2,10 @@
 
 An append-only event log on [Tigris](https://www.tigrisdata.com/).
 
-It is built for the projects it is used in rather than for everyone: it targets
+It is built for the projects it is used in rather than for everyone. It targets
 Tigris specifically, and leans on two things Tigris gives you that plain S3 does
-not — global strong consistency on demand, and an API that returns thousands of
-objects in one request.
+not: strong consistency on demand, and an API that returns thousands of objects
+in one request.
 
 One store is one stream, under one prefix in one bucket:
 
@@ -24,7 +24,7 @@ digits), so the newest object sorts first and finding the head is one LIST with
 
 | module | namespace | depends on |
 | --- | --- | --- |
-| `core` | `simplemono.event-store` — the `EventStore` and `EventReplay` protocols | nothing |
+| `core` | `simplemono.event-store` — the `EventAppend` and `EventSource` protocols | nothing |
 | `tigris` | `simplemono.event-store.tigris` — the implementation | `core`, `awssdk/s3`, `commons-compress` |
 | `memory` | `simplemono.event-store.memory` — an in-memory implementation | `core` |
 | `memory-client` | `simplemono.event-store.memory-client` — test doubles | `awssdk/s3`, `commons-compress` |
@@ -57,18 +57,26 @@ need the protocol, and on `memory` in your tests.
 (event-store/try-append! store 0 {:event/type :example/happened})
 ;; => true
 
-(event-store/get-event store 0)
-;; => {:event/type :example/happened}
-
-(event-store/latest-event-number store)
-;; => 0
-
-(event-store/reduce-events store 0 conj [])
-;; => [{:event/type :example/happened}]
+(reduce f init (event-store/events store 0))
+(into [] (event-store/events store 0))
+(transduce (filter interesting?) conj [] (event-store/events store 42))
 ```
 
-The endpoint and region are Tigris's own, and `X-Tigris-Consistent` is sent by
-default — a replay on one cell has to see what another wrote a moment ago.
+That is the whole interface. Two protocols with one method each, because
+reading and writing a stream are separate jobs, and a projection can be handed
+something that only reads.
+
+`events` returns something reducible and deliberately not seqable. The
+implementation holds an archive open while it walks, and reducing means that is
+closed by the time the call returns, which a lazy sequence handed to a caller
+could not promise.
+
+There is no separate point read. Reading one event by number is a reduction
+that stops after the first, and costs one request:
+
+```clojure
+(reduce (fn [_ event] (reduced event)) nil (event-store/events store 42))
+```
 
 ## Appending
 
@@ -119,83 +127,74 @@ where. A `false` from `try-append!` always means somebody else won.
 
 ## Replaying
 
-```clojure
-(event-store/reduce-events store 0 conj [])
-```
-
-It reduces rather than returning a sequence on purpose: the implementation
-holds a stream open for the traversal, and a callback closes it by the time the
-call returns. `f` may return `reduced` to stop early, and the traversal stops at
-the first event number that does not exist.
-
 **A replay does not read one object per event.** Tigris can return many objects
-as a single streaming tar — `POST /{bucket}?bundle` with a list of keys — so a
-replay costs **one request per `:bundle-size` events**, 1000 by default. For
-thirty million events that is thirty thousand requests instead of thirty
-million.
+as a single streaming tar — `POST /{bucket}?bundle` with a list of keys — so
+reading a stream costs about one request per hundred events rather than one per
+event.
 
 Nothing is written to make this fast. There are no packs, no index, no
 compaction, nothing to keep current and nothing to rebuild after a schema
-change — and the first replay of a stream is exactly as cheap as the tenth.
+change, and the first replay of a stream is exactly as cheap as the tenth.
 
-**The bundle is the one request that does not go through the leader.**
-`X-Tigris-Consistent` costs roughly five times the latency on a bundle and
-nothing measurable on the LIST that bounds it, and it buys less than it looks:
-event objects are immutable and create-only, so an eventually consistent read
-can only be *missing* an object, never show an old version of one. A missing
-one is detectable — a batch shorter than the head promised, for a reason the
-reducing function did not cause — and is read again through the leader, failing
-loudly if it is still short. The cheap path runs every time and is paid for
-only when it turns out to be wrong.
+A replay has three steps.
 
-Two details worth knowing. Event numbers are gap-free, so the keys for a batch
-are computed rather than listed — one LIST for the head bounds the last batch,
-and the replay never asks for a key that cannot exist. And entry names are
-checked against the keys asked for: a gap-free stream cannot legitimately skip
-one, and a replay that quietly dropped an event would be worse than one that
-stopped.
+**One key, through the leader.** This is the whole of an idle replay, a
+projection asking whether anything happened when nothing has, which is the call
+that runs most often. It is also the whole of reading one event by number. One
+request, no LIST.
 
-### The first event is read on its own
+**One LIST for the head**, and only once there is something to read. It is a
+Class A operation, about ten times the price of a read, and it earns that by
+bounding every batch that follows.
 
-Before any of that, a replay reads the event at `from` with a plain GET.
+**Batches up to the head, relaxed.** Every key in them is known to be there.
+Passing the head, one more key is asked of the leader, which ends the replay
+and would catch a stream that grew while it was being read.
 
-Whether the next event exists is the cheapest question there is, and the answer
-is the event itself. It is also the whole of an idle replay — a projection
-asking whether anything has happened, when nothing has — which is the call that
-runs most often. That now costs **one GET and no LIST**: a GET is Class B, while
-a LIST is Class A and roughly ten times the price. Only a replay that finds
-something goes on to spend the LIST, where there is work to amortise it over.
+### Which reads go through the leader
 
-Measured against a real bucket, on a stream of a thousand events:
+Not a matter of taste. Measured against a real bucket:
 
-| replay | LISTs | GETs | wall clock |
-| --- | --- | --- | --- |
-| idle | **0** | 1 | 66ms |
-| one event behind | 2 | 1 | 102ms |
-| all thousand | 2 | 1 | 1.8s |
+| | relaxed | through the leader |
+| --- | --- | --- |
+| a key that is there | ~1ms | ~6ms |
+| a key that is **not** there | **~250ms** | ~9ms |
 
-### Why not just ask for a full batch
+Reading present events relaxed is seven times cheaper. Discovering an absent
+one relaxed is twenty-seven times dearer. So a replay never asks a relaxed read
+about a key that might not exist, which is what the head bound is for, and it
+asks single keys of the leader, where a miss is cheap.
 
-Letting Tigris skip what is missing, instead of bounding every batch by the
-head, would be simpler. It is far worse than it looks: a key that is not there
-costs about **7ms** to discover, flat and linear. A 5000-key batch past the end
-of a short stream takes **35 seconds** and answers with half a megabyte naming
-everything that was absent.
+That is also why a full batch past the end of a stream is not an option, though
+it would be simpler: a hundred absent keys is twenty-five seconds, and a
+thousand is four minutes. Setting `on-error` to fail rather than skip does not
+help, because Tigris resolves every key before it decides.
 
-Setting `x-tigris-bundle-on-error` to `fail` rather than `skip` does not help.
-Tigris resolves every key before it decides, so a failing request takes the
-same 35 seconds — it just returns `404 BundleKeyNotFound` at the end of it
-instead of an archive.
+### What a short batch means
 
-`EventReplay` is an *optional* protocol. An implementation adopts it when its
-storage can read in bulk faster than one event at a time, the way a collection
-implements `CollReduce` to beat the generic path. `memory` does not, and
-replays through the fallback.
+Usually a replica that has not caught up. The batch is bounded by the head, so
+those events were promised, and stopping there would silently truncate the
+replay. Only the keys the first read did not return are asked again, of the
+leader, carrying on from the accumulator the first read produced. Re-reading
+the whole batch would hand the reducing function the same events twice, which
+`into` and `transduce` would not undo, because they use transients.
+
+Entry names are checked against the keys asked for. A gap-free stream cannot
+legitimately skip one, so an event arriving where another was expected stops
+the replay. The exception is a missing key at the *end* of a batch, which
+cannot be told from the end of the stream. Nothing ever deletes an event, so
+that means corruption rather than a race.
+
+### Measured
+
+Two hundred events on a real bucket: **four bundle requests and one LIST, about
+350ms**. An idle replay is one request. Reading one event by number is one
+request.
 
 ## Events
 
 Events must be EDN round-trippable values, and should stay small: a replay
-pulls `:bundle-size` of them in one response. Keep large payloads in a blob
+pulls up to a hundred of them in one response. Keep large payloads in a blob
 store and put the blob's name in the event.
 
 ## Why single events, not commits
@@ -251,24 +250,16 @@ default provider chain has them, and accepts:
 | `:client` | built from the credentials | an `S3Client`, if you would rather build it or hand in a double |
 | `:bundle-request` | the real bundle POST | a fn of `[store keys]` returning a tar `InputStream`, for tests |
 | `:headers` | `X-Tigris-Consistent: true` | extra request headers, merged over the default |
-| `:bundle-size` | `1000` | events per replay request; also the maximum, see below |
 | `:on-retry` | prints to `*err*` | called with `{:op :key :attempt :exception}` before each retry |
 
-`:bundle-size` is capped at 1000 although Tigris accepts 5000, because a bundle
-costs per key rather than per request. Reading a thousand present events takes
-about as long in one request as in twenty:
+There is no batch-size option. Batches are bounded by the head and capped at a
+hundred, which is where the round-trip saving flattens out: a hundred keys come
+back in 100ms and two hundred in 183ms.
 
-| batch | requests | total |
-| --- | --- | --- |
-| 1000 | 1 | 6 371ms |
-| 250 | 4 | 6 363ms |
-| 100 | 10 | 6 904ms |
-| 50 | 20 | 7 083ms |
-
-A larger batch therefore buys close to nothing, while a smaller one bounds
-everything that goes wrong with a batch: the keys in the request body, the
-archive held open, what a consistent re-read costs, and how far past the end a
-mistake can reach.
+`tigris/latest-event-number` is a plain function rather than a protocol method.
+A replay finds the end of a stream by walking off it and an append is told its
+number by the caller, so nothing in the library needs to dispatch on it. It is
+there for a health check or a look at a stream from the REPL.
 
 ## Testing your own code
 
@@ -281,14 +272,18 @@ Depend on `memory` and build a store that needs no network:
 (def store (memory/store))
 
 (event-store/try-append! store 0 {:event/type :example/happened})
-(event-store/reduce-events store 0 conj [])
+(into [] (event-store/events store 0))
 ```
 
 Pass your own atom over a sorted map to `memory/store` to seed a stream or to
 inspect one. Appends are serialised, so concurrent writers see the same
-create-only, gap-free behaviour Tigris gives them. What it cannot reproduce is a
-network: there is no retrying and no uncertain write, because an append here
-either happened or threw.
+create-only, gap-free behaviour Tigris gives them. Reading one event from a map
+costs what reading a hundred does, so `events` there is the generic walk in
+`simplemono.event-store/one-at-a-time`, which any implementation can use in a
+line.
+
+What it cannot reproduce is a network: there is no retrying and no uncertain
+write, because an append here either happened or threw.
 
 ## Testing this library
 

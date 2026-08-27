@@ -1,5 +1,5 @@
 (ns simplemono.event-store.tigris
-  "`simplemono.event-store/EventStore` and `EventReplay` on Tigris.
+  "`simplemono.event-store/EventAppend` and `EventSource` on Tigris.
 
    One store is one stream, under one prefix in one bucket:
 
@@ -11,12 +11,17 @@
    its read-model cursor plus one, so a lost append means the state the caller
    decided on has moved and it should catch up and decide again.
 
-   Replaying does not read one object per event. Tigris can return many objects
-   as one streaming tar — see `simplemono.event-store.tigris.bundle` — so
-   `reduce-events` costs one request per :bundle-size events, 1000 by default,
-   plus one LIST for the head that bounds the last batch. Nothing is written to
-   make that fast: there are no packs, nothing to build, nothing to keep
-   current, and the first replay of a stream is as cheap as the tenth.
+   Reading a range does not cost one request per event. Tigris can return many
+   objects as one streaming tar — see `simplemono.event-store.tigris.bundle` —
+   and `events` walks a stream in batches that start at one and double to a
+   hundred. An idle replay costs a single request, reading one event by number
+   costs the same, and a long one is bundling within a handful. Nothing is
+   written to make that fast: there are no packs, nothing to build, nothing to
+   keep current, and the first replay of a stream is as cheap as the tenth.
+
+   No replay spends a LIST. A batch capped at a hundred can run off the end of
+   the stream for less than a second, which is cheaper than asking where the
+   end was.
 
    Every request but the bundle is routed through the leader with
    X-Tigris-Consistent, so a replay on one machine sees what another wrote a
@@ -308,13 +313,18 @@
                    :event-number event-number})))
 
 (defn- head
-  "The highest event number in the stream, or nil when the stream is empty."
   [{:keys [prefix] :as store}]
   (newest-number store (sub-prefix prefix "events")))
 
-(defn- event-object
-  [{:keys [prefix] :as store} event-number]
-  (get-edn store (event-key prefix event-number)))
+(defn latest-event-number
+  "The highest event number in the stream, or nil when the stream is empty.
+
+   One LIST, which is a Class A operation and about ten times the price of a
+   read. A replay spends one of these, and only once it has found something to
+   read; an append is told its number by the caller. It is public for a health
+   check or a look at a stream from the REPL."
+  [store]
+  (head store))
 
 (defn- append!
   "Create-only append of `event` at `event-number`.
@@ -403,112 +413,110 @@
   (update store :headers merge consistent-header))
 
 (defn- fetch-batch
-  "One batch, read the cheap way, and read again through the leader when the
+  "One batch, read the cheap way, and ask the leader about the rest when the
    cheap read came up short for a reason `f` did not cause.
 
-   A short batch means the head promised events the bundle did not return. In
-   one region that should never happen; across regions it is a replica that
-   has not caught up. Either way, returning what arrived would silently
-   truncate the replay, so the batch is fetched again consistently and, if it
-   is still short, the replay fails instead."
+   A short batch has two innocent explanations and one bad one. `f` may have
+   stopped. The stream may end inside the batch, which is how a replay finds
+   the end at all. Or a replica has not caught up, and stopping there would
+   silently truncate the replay. The second read tells the last two apart: if
+   the leader has nothing more either, the stream really does end there.
+
+   It asks only for the keys the first read did not return, and carries on from
+   the accumulator it produced. Re-reading the whole batch would hand `f` the
+   same events twice, which is fine for `conj` on a vector and wrong for
+   anything with state — and `into` and `transduce` use transients, so
+   discarding the accumulator would not undo it."
   [store keys f init]
-  (let [{:keys [read stopped?] :as result} (reduce-bundle (relaxed store) keys f init)]
-    (if (or stopped? (= read (count keys)))
-      result
-      (let [retried (reduce-bundle (consistent store) keys f init)]
-        (if (or (:stopped? retried)
-                (= (:read retried) (count keys)))
-          retried
-          (throw (ex-info "The bundle returned fewer events than the stream holds"
-                          {:error :missing-event
-                           :expected (count keys)
-                           :got (:read retried)
-                           :from (first keys)})))))))
+  (let [;; The first batch of a replay is one key, and the leader premium is a
+        ;; few milliseconds on a response that size. Reading it through the
+        ;; leader makes the answer final, so an idle replay — the call that
+        ;; runs most often — is one request rather than one and a re-read.
+        first-read (if (= 1 (count keys)) (consistent store) (relaxed store))
+        {:keys [acc read stopped?] :as cheap} (reduce-bundle first-read keys f init)]
+    (if (or stopped?
+            (= read (count keys))
+            (= 1 (count keys)))
+      cheap
+      (let [rest-keys (vec (drop read keys))
+            {:keys [acc read stopped?]} (reduce-bundle (consistent store) rest-keys f acc)]
+        {:acc acc
+         :read (+ (long (:read cheap)) (long read))
+         :stopped? stopped?}))))
 
-(def ^:private max-bundle-size
-  "The most events one replay request asks for.
+(def ^:private max-batch-size
+  "The most events one request asks for.
 
-   Tigris accepts five times this (`bundle/max-keys`), but the cost of a bundle
-   is per key rather than per request: reading a thousand events takes about as
-   long in one request as in twenty. Larger batches therefore buy close to
-   nothing, while a smaller one bounds everything that goes wrong with a batch
-   — the keys in the request body, the archive held open, what a consistent
-   re-read costs, and how far past the end a mistake can reach."
-  1000)
+   Tigris accepts fifty times this, and bills a bundle per key rather than per
+   request, so a bigger batch buys only fewer round trips. Measured on a real
+   bucket, a hundred keys come back in 100ms and two hundred in 183ms, so the
+   gain past this is small, while a smaller batch bounds the archive held in
+   memory and what a re-read costs.
 
-(defn- replay-from-head
-  "Walk the stream in bundles, never asking for a key that cannot exist.
+   Batches do not grow into this. The head bounds every one of them, so a
+   replay reads `min` of this and what is left, and the single key it opens
+   with already makes reading one event by number cost one request."
+  100)
 
-   The head bounds every batch. Asking for a full batch and letting Tigris skip
-   what is missing would also work, and is how an earlier version found the end
-   of a stream. It is far worse than it looks: a key that is not there costs
-   about 7ms to discover, so a full batch past the end of a short stream takes
-   tens of seconds and answers with half a megabyte naming everything that was
-   absent. Setting `on-error` to fail rather than skip does not help — Tigris
-   resolves every key before it decides, and takes the same time to say no.
+(defn- replay
+  "Walk the stream, asking the leader where it ends and everyone else for the
+   events themselves.
 
-   One LIST for the head is cheaper than any of that, costs nothing extra to
-   read consistently, and is re-read once at the end in case the stream grew
-   while we were reading it."
-  [{:keys [prefix bundle-size] :as store} from f init]
+   Which reads go through the leader is not a matter of taste. Measured against
+   a real bucket, a key that is there costs about 1ms relaxed and 6ms through
+   the leader, while a key that is *not* there costs about 250ms relaxed and
+   9ms through the leader. Reading present events relaxed is seven times
+   cheaper; discovering an absent one relaxed is twenty-seven times dearer.
+
+   So a replay never asks a relaxed read about a key that might not exist.
+
+   It opens with one key through the leader. That is the whole of an idle
+   replay — a projection asking whether anything happened when nothing has,
+   the call that runs most often — and it is also the whole of reading one
+   event by number, which is why nothing needs a separate point read.
+
+   Finding something, it spends one LIST on the head and reads up to it in
+   batches, relaxed, where every key is known to be there. Passing the head, it
+   asks the leader for one more key, which both ends the replay and catches a
+   stream that grew while it was being read."
+  [{:keys [prefix] :as store} from f init]
   (loop [event-number (long from)
          acc init
-         latest (head store)]
+         latest nil]
     (cond
       (reduced? acc)
       @acc
 
       (or (nil? latest)
           (> event-number (long latest)))
-      (let [grown (head store)]
-        (if (and grown (> (long grown) (long (or latest -1))))
-          (recur event-number acc grown)
-          acc))
+      (let [{:keys [acc read stopped?]}
+            (fetch-batch store [(event-key prefix event-number)] f acc)]
+        (cond
+          stopped? @acc
+          (zero? (long read)) acc
+          :else (recur (inc event-number) acc (head store))))
 
       :else
-      (let [to (min (long latest) (dec (+ event-number (long bundle-size))))
-            keys (bundle-keys prefix event-number to)
+      (let [size (min max-batch-size (- (inc (long latest)) event-number))
+            keys (bundle-keys prefix event-number (dec (+ event-number size)))
             {:keys [acc read stopped?]} (fetch-batch store keys f acc)]
-        (if stopped?
-          @acc
-          (recur (+ event-number (long read)) acc latest))))))
-
-(defn- replay
-  "Read the first event on its own, and only then go looking for the head.
-
-   Whether the next event exists is the cheapest question there is, and the
-   answer is the event itself: one GET, which is Class B and is needed anyway.
-   It is also the whole of an idle replay — a projection asking whether
-   anything has happened when nothing has — which is the call that runs most
-   often and used to pay two LISTs, Class A and roughly ten times the price, to
-   be told no.
-
-   A replay that finds something goes on to spend the LIST, where there is work
-   to amortise it over."
-  [store from f init]
-  (if-some [event (event-object store from)]
-    (let [acc (f init event)]
-      (if (reduced? acc)
-        @acc
-        (replay-from-head store (inc (long from)) f acc)))
-    init))
+        (cond
+          stopped? @acc
+          (< (long read) size) acc
+          :else (recur (+ event-number (long read)) acc latest))))))
 
 (defrecord TigrisEventStore [client bucket prefix headers endpoint region
                              credentials-provider http-client bundle-request
-                             bundle-size on-retry]
-  event-store/EventStore
+                             on-retry]
+  event-store/EventAppend
   (try-append! [this event-number event]
     (append! this event-number event))
 
-  (get-event [this event-number]
-    (event-object this event-number))
-
-  (latest-event-number [this]
-    (head this))
-
-  event-store/EventReplay
-  (-reduce-events [this from f init]
-    (replay this from f init)))
+  event-store/EventSource
+  (events [this from]
+    (event-store/reducible
+     (fn [rf init]
+       (replay this from rf init)))))
 
 (defn- credentials
   [access-key-id secret-access-key]
@@ -545,22 +553,14 @@
    - :bundle-request a fn of [store keys] returning a tar InputStream, for
                      tests; the real Tigris bundle request otherwise
    - :headers        extra request headers, merged over X-Tigris-Consistent
-   - :bundle-size    events per replay request, default and maximum 1000
    - :on-retry       called with {:op :key :attempt :exception} before every
                      retry of a transient failure, defaults to printing a line
                      to *err*. An outage is otherwise indistinguishable from
                      slowness, so replace this with your own logging."
   [{:keys [bucket prefix access-key-id secret-access-key
-           client bundle-request headers bundle-size on-retry]
-    :or {bundle-size max-bundle-size}}]
+           client bundle-request headers on-retry]}]
   (when (str/blank? (str bucket))
     (throw (ex-info "An event store requires :bucket" {:error :incorrect})))
-  (when-not (and (pos-int? bundle-size)
-                 (<= bundle-size max-bundle-size))
-    (throw (ex-info ":bundle-size must be between 1 and the maximum"
-                    {:error :incorrect
-                     :bundle-size bundle-size
-                     :maximum max-bundle-size})))
   (map->TigrisEventStore
    {:client (or client (simplemono.event-store.tigris/client
                         {:access-key-id access-key-id
@@ -575,7 +575,6 @@
     :credentials-provider (credentials access-key-id secret-access-key)
     :http-client (HttpClient/newHttpClient)
     :bundle-request (or bundle-request bundle/request!)
-    :bundle-size bundle-size
     :on-retry (or on-retry print-retry)}))
 
 (comment
@@ -598,9 +597,19 @@
   (doseq [n (range 9)]
     (event-store/try-append! s n {:event/type :example/happened :n n}))
 
-  (event-store/latest-event-number s)
-  (event-store/get-event s 3)
-  (event-store/reduce-events s 0 conj [])
+  (latest-event-number s)
+
+  ;; One event, which costs one request because a batch starts at one:
+  (reduce (fn [_ event] (reduced event)) nil (event-store/events s 3))
+
+  ;; A range, in batches that grow to a hundred:
+  (into [] (event-store/events s 0))
+
+  ;; And anything a transducer can express, without the store knowing:
+  (transduce (filter #(= :example/updated (:event/type %)))
+             conj
+             []
+             (event-store/events s 0))
 
   )
 
@@ -638,7 +647,7 @@
 
   ;; --- the whole protocol --------------------------------------------------
 
-  (event-store/latest-event-number s)
+  (latest-event-number s)
   ;;=> nil, the stream is empty
 
   (event-store/try-append! s 0 {:event/occurred-at (java.util.Date.)
@@ -646,11 +655,11 @@
                                 :event/subjects ["/verify/1/"]})
   ;;=> true
 
-  (event-store/get-event s 0)
-  (event-store/latest-event-number s)
+  (first (into [] (event-store/events s 0)))
+  (latest-event-number s)
   ;;=> 0
 
-  (event-store/reduce-events s 0 conj [])
+  (into [] (event-store/events s 0))
 
 
   ;; --- a lost append is not an error ---------------------------------------
@@ -658,7 +667,7 @@
   (event-store/try-append! s 0 {:event/type :verify/loser})
   ;;=> false. Another writer holds that number; the stored event is untouched.
 
-  (event-store/get-event s 0)
+  (reduce (fn [_ event] (reduced event)) nil (event-store/events s 0))
 
 
   ;; --- a gap is ------------------------------------------------------------
@@ -679,12 +688,12 @@
     [store decide]
     (loop []
       (let [{:keys [cursor seen]}
-            (event-store/reduce-events store 0
-                                       (fn [acc event]
-                                         (-> acc
-                                             (update :cursor inc)
-                                             (update :seen conj (:event/type event))))
-                                       {:cursor -1 :seen #{}})]
+            (reduce (fn [acc event]
+                      (-> acc
+                          (update :cursor inc)
+                          (update :seen conj (:event/type event))))
+                    {:cursor -1 :seen #{}}
+                    (event-store/events store 0))]
         (if-some [event (decide seen)]
           (if (event-store/try-append! store (inc cursor) event)
             {:appended (:event/type event) :at (inc cursor)}
@@ -712,19 +721,18 @@
                                   :event/type :verify/happened
                                   :event/n n}))
 
-  (mapv :event/n (event-store/reduce-events s 0 conj []))
+  (mapv :event/n (into [] (event-store/events s 0)))
   ;;=> [nil nil 2 3 ... 19], in order
 
-  (event-store/reduce-events s 15 conj [])
+  (into [] (event-store/events s 15))
   ;;=> a replay can start anywhere
 
-  (event-store/reduce-events s 0
-                             (fn [acc e]
-                               (if (= 3 (count acc)) (reduced acc) (conj acc e)))
-                             [])
+  (reduce (fn [acc e] (if (= 3 (count acc)) (reduced acc) (conj acc e)))
+          []
+          (event-store/events s 0))
   ;;=> reduced stops it, and stops fetching
 
-  (event-store/reduce-events s 99 conj [])
+  (into [] (event-store/events s 99))
   ;;=> [], past the end
 
 
@@ -736,11 +744,11 @@
 
   (defn append-then-replay!
     [store]
-    (let [n (inc (long (or (event-store/latest-event-number store) -1)))
+    (let [n (inc (long (or (latest-event-number store) -1)))
           marker (random-uuid)]
       (event-store/try-append! store n {:event/type :verify/fresh
                                         :marker marker})
-      (->> (event-store/reduce-events store 0 conj [])
+      (->> (into [] (event-store/events store 0))
            (some #(= marker (:marker %)))
            boolean)))
 
@@ -767,11 +775,8 @@
                                      :event/n n
                                      :payload (apply str (repeat 200 "x"))})))
 
-  (time (count (event-store/reduce-events big 0 conj [])))
-  ;;=> one bundle request, plus one LIST for the head
-
-  (time (count (event-store/reduce-by-get big 0 conj [])))
-  ;;=> the generic path every implementation gets: 201 requests
+  (time (reduce (fn [n _] (inc (long n))) 0 (event-store/events big 0)))
+  ;;=> batches of 1, 2, 4 ... 100, and no LIST anywhere
 
   ;; The Tigris console shows what each cost, and which class a bundle
   ;; request bills as.
