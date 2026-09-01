@@ -24,7 +24,7 @@ digits), so the newest object sorts first and finding the head is one LIST with
 
 | module | namespace | depends on |
 | --- | --- | --- |
-| `core` | `simplemono.event-store` — the `EventAppend` and `EventSource` protocols | nothing |
+| `core` | `simplemono.event-store` — the `EventAppend`, `EventSource` and `EventHead` protocols | nothing |
 | `tigris` | `simplemono.event-store.tigris` — the implementation | `core`, `awssdk/s3`, `commons-compress` |
 | `memory` | `simplemono.event-store.memory` — an in-memory implementation | `core` |
 | `memory-client` | `simplemono.event-store.memory-client` — test doubles | `awssdk/s3`, `commons-compress` |
@@ -62,9 +62,11 @@ need the protocol, and on `memory` in your tests.
 (transduce (filter interesting?) conj [] (event-store/events store 42))
 ```
 
-That is the whole interface. Two protocols with one method each, because
-reading and writing a stream are separate jobs, and a projection can be handed
-something that only reads.
+That is the whole interface. Three protocols with one method each —
+`EventAppend`, `EventSource` and `EventHead` — because appending to a stream,
+reading it, and asking where it ends are separate jobs. A projection can be
+handed something that only reads, and something that only reads never has to
+implement a head lookup it does not need.
 
 `events` returns something reducible and deliberately not seqable. The
 implementation holds an archive open while it walks, and reducing means that is
@@ -263,10 +265,14 @@ There is no batch-size option. Batches are bounded by the head and capped at a
 hundred, which is where the round-trip saving flattens out: a hundred keys come
 back in 100ms and two hundred in 183ms.
 
-`tigris/latest-event-number` is a plain function rather than a protocol method.
-A replay finds the end of a stream by walking off it and an append is told its
-number by the caller, so nothing in the library needs to dispatch on it. It is
-there for a health check or a look at a stream from the REPL.
+`latest-event-number` is the `EventHead` protocol's one method, and one LIST
+here. Nothing in the library needs it — a replay finds the end of a stream by
+walking off it and an append is told its number by the caller — but callers
+do: deciding without a read model, a health check, a look at a stream from the
+REPL. It started as a plain per-implementation function on the grounds that
+nothing dispatched on it, and the first store-agnostic caller disproved that
+by passing the right implementation's function around by hand, which is
+protocol dispatch done manually.
 
 ## Testing your own code
 

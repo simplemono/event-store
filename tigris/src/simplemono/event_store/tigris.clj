@@ -1,5 +1,6 @@
 (ns simplemono.event-store.tigris
-  "`simplemono.event-store/EventAppend` and `EventSource` on Tigris.
+  "`simplemono.event-store/EventAppend`, `EventSource` and `EventHead` on
+   Tigris.
 
    One store is one stream, under one prefix in one bucket:
 
@@ -320,18 +321,11 @@
                    :event-number event-number})))
 
 (defn- head
+  "One LIST, which is a Class A operation and about ten times the price of a
+   read. A replay spends one of these, and only once it has found something to
+   read; `latest-event-number` hands the same lookup to callers."
   [{:keys [prefix] :as store}]
   (newest-number store (sub-prefix prefix "events")))
-
-(defn latest-event-number
-  "The highest event number in the stream, or nil when the stream is empty.
-
-   One LIST, which is a Class A operation and about ten times the price of a
-   read. A replay spends one of these, and only once it has found something to
-   read; an append is told its number by the caller. It is public for a health
-   check or a look at a stream from the REPL."
-  [store]
-  (head store))
 
 (defn- append!
   "Create-only append of `event` at `event-number`.
@@ -536,7 +530,11 @@
   (events [this from]
     (util/reducible
      (fn [rf init]
-       (replay this from rf init)))))
+       (replay this from rf init))))
+
+  event-store/EventHead
+  (latest-event-number [this]
+    (head this)))
 
 (defn- credentials
   [access-key-id secret-access-key]
@@ -616,7 +614,7 @@
   (doseq [n (range 9)]
     (event-store/try-append! s n {:event/type :example/happened :n n}))
 
-  (latest-event-number s)
+  (event-store/latest-event-number s)
 
   ;; One event, which costs one request because a batch starts at one:
   (reduce (fn [_ event] (reduced event)) nil (event-store/events s 3))
@@ -666,7 +664,7 @@
 
   ;; --- the whole protocol --------------------------------------------------
 
-  (latest-event-number s)
+  (event-store/latest-event-number s)
   ;;=> nil, the stream is empty
 
   (event-store/try-append! s 0 {:event/occurred-at (java.util.Date.)
@@ -675,7 +673,7 @@
   ;;=> true
 
   (first (into [] (event-store/events s 0)))
-  (latest-event-number s)
+  (event-store/latest-event-number s)
   ;;=> 0
 
   (into [] (event-store/events s 0))
@@ -763,7 +761,7 @@
 
   (defn append-then-replay!
     [store]
-    (let [n (inc (long (or (latest-event-number store) -1)))
+    (let [n (inc (long (or (event-store/latest-event-number store) -1)))
           marker (random-uuid)]
       (event-store/try-append! store n {:event/type :verify/fresh
                                         :marker marker})

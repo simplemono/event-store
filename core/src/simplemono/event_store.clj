@@ -9,9 +9,11 @@
 
    `simplemono.event-store.tigris` is the implementation for Tigris.
 
-   There are two protocols with one method each, because reading and writing a
-   stream are separate jobs. A projection can be handed something that only
-   reads and cannot append by mistake.
+   There are three protocols with one method each, because appending to a
+   stream, reading it, and asking where it ends are separate jobs. A
+   projection can be handed something that only reads and cannot append by
+   mistake, and a consumer of `EventSource` alone never has to implement a
+   head lookup it does not need.
 
    This namespace holds the protocols and nothing else.
    `simplemono.event-store.util` has the helpers an implementation of `events`
@@ -62,3 +64,19 @@
 
      How the events are fetched is the store's business, because only the store
      knows what a request costs."))
+
+(defprotocol EventHead
+  (latest-event-number [store]
+    "The highest event number in the stream, or nil when it is empty.
+
+     Nothing in this library needs it: a replay finds the end of a stream by
+     walking off it, and an append is told its number by the caller, normally
+     a read-model cursor plus one. It is a protocol method because callers
+     do need it — deciding without a read model, a health check, a look at a
+     stream from the REPL — and generic code should not have to know which
+     implementation it holds to ask.
+
+     It is deliberately not part of `EventSource`: reading by reducing never
+     requires the head, so something that only implements `events` stays a
+     one-method reify. What an answer costs is the implementation's business —
+     on Tigris it is one LIST, about ten times the price of a read."))

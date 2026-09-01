@@ -12,7 +12,7 @@
 
 (deftest appends-are-create-only-and-gap-free
   (let [s (memory/store)]
-    (is (nil? (memory/latest-event-number s)))
+    (is (nil? (event-store/latest-event-number s)))
     (testing "a number beyond the head would leave a hole"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
                             #"Append would create a gap"
@@ -25,7 +25,7 @@
     (testing "losing the race is a false, not an exception"
       (is (false? (event-store/try-append! s 0 (event 0)))))
     (is (true? (event-store/try-append! s 1 (event 1))))
-    (is (= 1 (memory/latest-event-number s)))
+    (is (= 1 (event-store/latest-event-number s)))
     (is (= [(event 0) (event 1)] (into [] (event-store/events s 0))))
     (is (= [(event 1)] (into [] (event-store/events s 1))))
     (is (= [] (into [] (event-store/events s 2))))))
@@ -37,7 +37,7 @@
     (event-store/try-append! s 1 (event 1))
     (is (= {0 (event 0) 1 (event 1)} @state))
     (testing "a second store over the same atom sees the same stream"
-      (is (= 1 (memory/latest-event-number (memory/store state)))))))
+      (is (= 1 (event-store/latest-event-number (memory/store state)))))))
 
 (deftest concurrent-appends-produce-one-winner-per-number
   (let [s (memory/store)
@@ -49,7 +49,7 @@
     (is (= 1 (count (filter true? results)))
         "exactly one writer creates event 0")
     (is (= (dec writers) (count (filter false? results))))
-    (is (= 0 (memory/latest-event-number s)))))
+    (is (= 0 (event-store/latest-event-number s)))))
 
 (deftest replaying-reads-every-event-in-order
   (let [s (memory/store)]

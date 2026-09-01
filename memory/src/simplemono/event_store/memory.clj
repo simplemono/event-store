@@ -1,5 +1,6 @@
 (ns simplemono.event-store.memory
-  "`simplemono.event-store/EventAppend` and `EventSource` in memory.
+  "`simplemono.event-store/EventAppend`, `EventSource` and `EventHead` in
+   memory.
 
    One store is one stream, held in an atom over a sorted map from event
    number to event. Nothing is persisted and nothing is shared between stores.
@@ -55,12 +56,11 @@
   (events [_ from]
     ;; Reading one event from a map costs what reading a hundred does, so the
     ;; generic walk is also the fastest one available here.
-    (util/one-at-a-time #(get @state (long %)) from)))
+    (util/one-at-a-time #(get @state (long %)) from))
 
-(defn latest-event-number
-  "The highest event number in the stream, or nil when it is empty."
-  [store]
-  (last (keys @(:state store))))
+  event-store/EventHead
+  (latest-event-number [_]
+    (last (keys @state))))
 
 (defn store
   "An in-memory event store.
@@ -76,13 +76,13 @@
 
   (def s (store))
 
-  (latest-event-number s)
+  (event-store/latest-event-number s)
 
   (event-store/try-append! s 0 {:event/type :example/created})
   (event-store/try-append! s 0 {:event/type :example/created})
 
   (into [] (event-store/events s 0))
-  (latest-event-number s)
+  (event-store/latest-event-number s)
 
   ;; Seed a stream and look at it:
   (def state (atom (sorted-map)))
