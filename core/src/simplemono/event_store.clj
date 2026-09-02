@@ -1,5 +1,5 @@
 (ns simplemono.event-store
-  "The event store protocol.
+  "The event store protocols.
 
    An event store is one stream: an append-only sequence of events numbered
    from zero, without gaps. Implementations own their storage and their
@@ -7,15 +7,24 @@
    dependencies of its own so that a backend can implement it without dragging
    in another backend's.
 
-   `simplemono.event-store.s3` is the implementation for S3-compatible object
-   storage.
+   `simplemono.event-store.tigris` is the implementation for Tigris.
+
+   There are three protocols with one method each, because appending to a
+   stream, reading it, and asking where it ends are separate jobs. A
+   projection can be handed something that only reads and cannot append by
+   mistake, and a consumer of `EventSource` alone never has to implement a
+   head lookup it does not need.
+
+   This namespace holds the protocols and nothing else.
+   `simplemono.event-store.util` has the helpers an implementation of `events`
+   would otherwise repeat.
 
    Command handling, projections, retries and idempotency live in the
    application. The usual loop is to catch a read model up, decide against it,
    and append at the cursor plus one; a false return means the state the
    decision rested on has moved, so the caller catches up and decides again.")
 
-(defprotocol EventStore
+(defprotocol EventAppend
   (try-append! [store event-number event]
     "Create-only append of `event` at zero-based `event-number`.
 
@@ -35,51 +44,39 @@
 
      An event must be a value the implementation can store and read back
      unchanged, which is what lets an implementation settle an uncertain write
-     by comparing what is stored with what it meant to store.")
+     by comparing what is stored with what it meant to store."))
 
-  (get-event [store event-number]
-    "The event at `event-number`, or nil when it does not exist.")
+(defprotocol EventSource
+  (events [store from]
+    "The events from `from` onwards, as something `reduce` can walk.
 
+       (reduce f init (events store 0))
+       (transduce (filter interesting?) conj [] (events store 42))
+
+     The walk stops at the first event number that does not exist, and `f` may
+     return `reduced` to stop sooner.
+
+     What comes back is reducible and deliberately not seqable. An
+     implementation may hold a connection or an archive open while it reads,
+     and reducing means that is closed by the time the call returns, which a
+     lazy sequence handed to a caller could not promise. Anyone who wants the
+     whole stream in memory can still write `(into [] …)` and say so.
+
+     How the events are fetched is the store's business, because only the store
+     knows what a request costs."))
+
+(defprotocol EventHead
   (latest-event-number [store]
-    "The highest event number in the stream, or nil when the stream is empty."))
+    "The highest event number in the stream, or nil when it is empty.
 
-(defprotocol EventReplay
-  "An optional acceleration for reading a stream in bulk.
+     Nothing in this library needs it: a replay finds the end of a stream by
+     walking off it, and an append is told its number by the caller, normally
+     a read-model cursor plus one. It is a protocol method because callers
+     do need it — deciding without a read model, a health check, a look at a
+     stream from the REPL — and generic code should not have to know which
+     implementation it holds to ask.
 
-   Every `EventStore` can be replayed by fetching one event at a time, so this
-   protocol is not required: implement it only when the storage can do better,
-   the way a collection implements `CollReduce` to beat the generic path.
-   `reduce-events` picks whichever is available."
-  (-reduce-events [store from f init]
-    "Reduce over the events from `from` onwards. See `reduce-events`."))
-
-(defn reduce-by-get
-  "Reduce over the events from `from` onwards by fetching them one at a time.
-
-   The generic replay: correct for any `EventStore`, and what `reduce-events`
-   falls back to. An implementation of `EventReplay` that only accelerates part
-   of a stream can delegate the rest here."
-  [store from f init]
-  (loop [event-number (long from)
-         acc init]
-    (if (reduced? acc)
-      @acc
-      (if-some [event (get-event store event-number)]
-        (recur (inc event-number) (f acc event))
-        acc))))
-
-(defn reduce-events
-  "Reduce `f` over the events of `store` from `from` onwards, starting at
-   `init`, and stop at the first number that does not exist.
-
-   `f` is called with the accumulator and one event, and may return `reduced`
-   to stop early. Reducing rather than returning a sequence is deliberate: the
-   storage may hold a connection or a stream open for the traversal, and this
-   way it is closed by the time the call returns.
-
-   Uses the store's own bulk read when it has one and reads event by event
-   otherwise, so it works on every implementation."
-  [store from f init]
-  (if (satisfies? EventReplay store)
-    (-reduce-events store from f init)
-    (reduce-by-get store from f init)))
+     It is deliberately not part of `EventSource`: reading by reducing never
+     requires the head, so something that only implements `events` stays a
+     one-method reify. What an answer costs is the implementation's business —
+     on Tigris it is one LIST, about ten times the price of a read."))

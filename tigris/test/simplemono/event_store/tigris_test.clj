@@ -39,8 +39,7 @@
     (merge {:client (memory-client/client objects)
             :bucket "events"
             :prefix "org/acme"
-            :bundle-request (fn [_store keys] (memory-client/tar objects keys))
-            :bundle-size 4}
+            :bundle-request (fn [_store keys] (memory-client/tar objects keys))}
            overrides))))
 
 (defn- gunzip
@@ -71,9 +70,9 @@
       (is (false? (event-store/try-append! s 0 (event 0)))))
     (is (true? (event-store/try-append! s 1 (event 1))))
     (is (= 1 (event-store/latest-event-number s)))
-    (is (= (event 0) (event-store/get-event s 0)))
-    (is (= (event 1) (event-store/get-event s 1)))
-    (is (nil? (event-store/get-event s 2)))))
+    (is (= [(event 0) (event 1)] (into [] (event-store/events s 0))))
+    (is (= [(event 1)] (into [] (event-store/events s 1))))
+    (is (= [] (into [] (event-store/events s 2))))))
 
 (deftest objects-use-inverted-gzip-edn-keys
   (let [objects (objects)
@@ -117,12 +116,13 @@
     (let [objs (objects)
           retries (atom [])
           s (tigris/store {:client (failing-put-client objs 2 false)
-                       :bucket "events"
-                       :prefix "org/acme"
-                       :on-retry #(swap! retries conj (:op %))})]
+                           :bucket "events"
+                           :prefix "org/acme"
+                           :bundle-request (fn [_ keys] (memory-client/tar objs keys))
+                           :on-retry #(swap! retries conj (:op %))})]
       (is (true? (event-store/try-append! s 0 (event 0))))
       (is (= [:put :put] @retries) "the caller sees no failure, only the result")
-      (is (= (event 0) (event-store/get-event s 0)))))
+      (is (= (event 0) (reduce (fn [_ e] (reduced e)) nil (event-store/events s 0))))))
 
   (testing "a put that landed before it failed is recognised as ours"
     (let [objs (objects)
@@ -139,11 +139,12 @@
           winner (store objs)]
       (is (true? (event-store/try-append! winner 0 (event 99))))
       (let [s (tigris/store {:client (failing-put-client objs 1 false)
-                         :bucket "events"
-                         :prefix "org/acme"
-                         :on-retry (constantly nil)})]
+                             :bucket "events"
+                             :prefix "org/acme"
+                             :bundle-request (fn [_ keys] (memory-client/tar objs keys))
+                             :on-retry (constantly nil)})]
         (is (false? (event-store/try-append! s 0 (event 0))))
-        (is (= (event 99) (event-store/get-event s 0)))))))
+        (is (= (event 99) (reduce (fn [_ e] (reduced e)) nil (event-store/events s 0))))))))
 
 (deftest a-terminal-failure-is-thrown-at-once
   (let [attempts (atom 0)
@@ -166,7 +167,7 @@
     (is (true? (event-store/try-append! s 0 (event 0))))
     (is (= ["events/9223372036854775807"] (keys @objects)))))
 
-(deftest replaying-fetches-events-in-bundles
+(deftest a-replay-opens-with-one-key-then-reads-the-rest-bounded
   (let [objects (objects)
         requests (atom [])
         s (store objects {:bundle-request (fn [_store keys]
@@ -174,16 +175,18 @@
                                             (memory-client/tar objects keys))})]
     (append-range! s 0 9)
     (reset! requests [])
-    (is (= (mapv event (range 9))
-           (event-store/reduce-events s 0 conj []))
+    (is (= (mapv event (range 9)) (into [] (event-store/events s 0)))
         "every event comes back, in order, decoded from the tar")
-    (is (= [4 4] @requests)
-        "event 0 comes from the read that starts every replay, and the eight
-         after it in batches of four, bounded by the head")))
+    (is (= [1 8 1] @requests)
+        "one key to see whether there is anything at all, then everything up to
+         the head in one batch, then the one key past it that ends the replay
+         and would catch a stream that grew while it was read. No request ever
+         asks about a key that might not be there except through the leader,
+         where a miss costs 9ms instead of 250.")))
 
 (defn- counting-client
-  "Wraps a client and counts the two requests a replay can spend: the LIST that
-   finds the head, and the GET that reads one event."
+  "Wraps a client and counts what a replay is not supposed to spend any more:
+   a LIST for the head, and a single-object GET."
   [client lists gets]
   (proxy [software.amazon.awssdk.services.s3.S3Client] []
     (listObjectsV2 [request]
@@ -198,80 +201,108 @@
     (close [] (.close client))
     (serviceName [] (.serviceName client))))
 
-(deftest an-idle-replay-costs-one-get-and-no-list
-  ;; The hot path: a projection asking whether anything happened, when nothing
-  ;; has. One GET is Class B; a LIST is Class A and about ten times the price,
-  ;; and this used to spend two of them.
-  (let [objects (objects)
-        lists (atom 0)
-        gets (atom 0)
-        requests (atom [])
-        s (store objects
-                 {:client (counting-client (memory-client/client objects) lists gets)
-                  :bundle-request (fn [_store keys]
-                                    (swap! requests conj (count keys))
-                                    (memory-client/tar objects keys))})]
-    (append-range! s 0 4)
-    (reset! lists 0)
-    (reset! gets 0)
-    (reset! requests [])
-    (is (= [] (event-store/reduce-events s 4 conj [])))
-    (is (= 1 @gets) "the cheapest question is whether the next event exists")
-    (is (zero? @lists) "and it is answered without finding the head")
-    (is (= [] @requests) "no bundle either")))
+(defn- counting-store
+  "A store that reports what each replay cost: {:lists :gets :bundles}.
 
-(deftest a-replay-that-finds-something-pays-for-the-head
-  (let [objects (objects)
-        lists (atom 0)
-        gets (atom 0)
+   Lists and gets should both stay at zero. A replay walks the stream with
+   bundle requests alone."
+  [objects overrides]
+  (let [lists (atom 0) gets (atom 0) bundles (atom [])
         s (store objects
-                 {:client (counting-client (memory-client/client objects) lists gets)})]
-    (append-range! s 0 6)
-    (reset! lists 0)
-    (reset! gets 0)
-    (is (= (mapv event (range 6)) (event-store/reduce-events s 0 conj [])))
-    (is (= 1 @gets) "one event read on its own, the rest in bundles")
-    (is (pos? @lists) "the LIST is spent where there is work to amortise it")))
+                 (merge {:client (counting-client (memory-client/client objects)
+                                                  lists gets)
+                         :bundle-request (fn [_store keys]
+                                           (swap! bundles conj (count keys))
+                                           (memory-client/tar objects keys))}
+                        overrides))]
+    [s (fn cost
+         ([] (reset! lists 0) (reset! gets 0) (reset! bundles []) nil)
+         ([_] {:lists @lists :gets @gets :bundles @bundles}))]))
 
-(deftest bundle-size-is-capped-below-the-tigris-maximum
-  ;; A bundle costs per key, not per request, so a bigger batch buys close to
-  ;; nothing while making everything that goes wrong with one bigger.
-  (is (= 1000 (:bundle-size (tigris/store {:bucket "events" :prefix "org/acme"})))
-      "the default sits below the 5000 Tigris accepts")
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                        #":bundle-size must be between 1 and the maximum"
-                        (tigris/store {:bucket "events" :prefix "org/acme"
-                                       :bundle-size 5000}))))
+(deftest an-idle-replay-costs-one-request
+  ;; A projection asking whether anything happened, when nothing has. This is
+  ;; the call that runs most often, so it is the one worth making cheap.
+  (let [objects (objects)
+        [s cost] (counting-store objects {})]
+    (append-range! s 0 3)
+    (cost)
+    (is (= [] (into [] (event-store/events s 3))))
+    (is (= {:lists 0 :gets 0 :bundles [1]} (cost :report))
+        "one request for one key, and no LIST anywhere")))
+
+(deftest a-replay-spends-one-list-and-only-once-it-has-work
+  ;; A LIST is Class A, about ten times a read, so a replay buys exactly one
+  ;; and only after it knows there is something to read. Bounding the batches
+  ;; with it is what keeps every later read off a key that is not there, which
+  ;; a relaxed read discovers at about 250ms a time.
+  (let [objects (objects)
+        [s cost] (counting-store objects {})]
+    (append-range! s 0 20)
+    (cost)
+    (is (= 20 (count (into [] (event-store/events s 0)))))
+    (let [{:keys [lists gets]} (cost :report)]
+      (is (= 1 lists) "one, for the head that bounds the batches")
+      (is (zero? gets) "and no single-object read: everything goes by bundle"))))
+
+(deftest one-event-costs-one-request
+  ;; Because a batch starts at one, reading a single event by number needs no
+  ;; separate point-read method on the protocol.
+  (let [objects (objects)
+        [s cost] (counting-store objects {})]
+    (append-range! s 0 20)
+    (cost)
+    (is (= (event 7) (reduce (fn [_ e] (reduced e)) nil (event-store/events s 7))))
+    (is (= {:lists 0 :gets 0 :bundles [1]} (cost :report)))))
 
 (deftest a-replay-can-start-anywhere-and-stop-early
   (let [objects (objects)
         s (store objects)]
     (append-range! s 0 9)
     (is (= (mapv event (range 5 9))
-           (event-store/reduce-events s 5 conj [])))
-    (is (= [] (event-store/reduce-events s 9 conj [])))
+           (into [] (event-store/events s 5))))
+    (is (= [] (into [] (event-store/events s 9))))
     (testing "reduced stops the replay"
       (is (= (mapv event (range 2))
-             (event-store/reduce-events s 0
-                                        (fn [acc e]
-                                          (if (= 2 (count acc))
-                                            (reduced acc)
-                                            (conj acc e)))
-                                        []))))))
+             (reduce (fn [acc e]
+                       (if (= 2 (count acc)) (reduced acc) (conj acc e)))
+                     []
+                     (event-store/events s 0)))))))
 
 (deftest an-empty-stream-replays-to-init
-  (is (= :nothing (event-store/reduce-events (store (objects)) 0 conj :nothing))))
+  (is (= :nothing (reduce conj :nothing (event-store/events (store (objects)) 0)))))
 
-(deftest a-bundle-that-skips-an-event-is-reported
+(deftest a-hole-inside-a-batch-is-reported
   (let [objects (objects)
         s (store objects)]
     (append-range! s 0 8)
-    ;; A gap-free stream cannot legitimately be missing an event, so a bundle
-    ;; that silently leaves one out must stop the replay rather than drop it.
-    (swap! objects dissoc "org/acme/events/9223372036854775805")
+    ;; Event 5 vanishes, and the batch that covers it also covers events after
+    ;; it. Their names arrive where 5's was expected, which is the only way a
+    ;; gap-free stream can be caught missing one.
+    (swap! objects dissoc (str "org/acme/events/" (- Long/MAX_VALUE 5)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"Bundle returned an unexpected object"
-                          (event-store/reduce-events s 0 conj [])))))
+                          (into [] (event-store/events s 0))))))
+
+(deftest a-hole-the-head-promised-is-not-mistaken-for-the-end
+  ;; A batch is bounded by a consistently read head, so every key in it was
+  ;; promised to exist. A hole on the batch's last key is the one the entry
+  ;; names cannot catch, because nothing arrives after it to give it away.
+  ;; Asking the leader directly is the last innocent explanation, and once that
+  ;; comes back short too the events are simply gone.
+  ;;
+  ;; Ending the replay there would return a hundred events and lose the twenty
+  ;; after the hole, looking exactly like a correct short read.
+  (let [objects (objects)
+        s (store objects)]
+    (append-range! s 0 120)
+    (swap! objects dissoc (str "org/acme/events/" (- Long/MAX_VALUE 100)))
+    (let [t (try (count (into [] (event-store/events s 0)))
+                 (catch clojure.lang.ExceptionInfo t t))]
+      (is (instance? clojure.lang.ExceptionInfo t)
+          "the replay fails rather than returning a hundred events")
+      (is (= :missing-event (:error (ex-data t))))
+      (is (= [99 100] [(:got (ex-data t)) (:expected (ex-data t))])
+          "and says how much of the batch arrived against what was asked"))))
 
 (deftest headers-the-jdk-owns-are-not-copied-onto-the-request
   ;; The signer returns Host because it is signed, and the JDK's HttpClient
@@ -304,16 +335,20 @@
                                             (swap! seen conj (consistent? store))
                                             (memory-client/tar objects keys))})]
     (append-range! s 0 4)
-    (event-store/reduce-events s 0 conj [])
-    (is (= [false] @seen)
-        "reading through the leader costs about five times the latency on a
-         bundle, and buys nothing an object store that never updates an object
-         can give back")))
+    (is (= (mapv event (range 4)) (into [] (event-store/events s 0))))
+    (is (= [true false true] @seen)
+        "one key through the leader to see whether anything is there, then the
+         batch that carries weight relaxed, because the leader costs about five
+         times the latency on a bundle and buys nothing an object store that
+         never updates an object can give back. Single keys go through the
+         leader either way: a key that is not there costs about 250ms to
+         discover relaxed and 9ms through the leader.")))
 
 (deftest a-short-batch-is-read-again-through-the-leader
-  ;; The head promised four events. A replica that has not caught up returns
-  ;; three, and returning those would silently truncate the replay -- the
-  ;; caller would rebuild a read model missing an event and never know.
+  ;; A short batch is normally the end of the stream, and that is how a replay
+  ;; finds it. But it can also be a replica that has not caught up, and
+  ;; stopping there would silently truncate the replay. The re-read tells the
+  ;; two apart: if the leader has more, keep going.
   (let [objects (objects)
         seen (atom [])
         stale? (atom true)
@@ -321,29 +356,23 @@
                  {:bundle-request
                   (fn [store keys]
                     (swap! seen conj (consistent? store))
-                    (if (and @stale? (not (consistent? store)))
+                    (if (and @stale? (not (consistent? store)) (< 1 (count keys)))
                       (memory-client/tar objects (butlast keys))
                       (memory-client/tar objects keys)))})]
     (append-range! s 0 4)
-    (is (= (mapv event (range 4))
-           (event-store/reduce-events s 0 conj []))
+    (is (= (mapv event (range 4)) (into [] (event-store/events s 0)))
         "every event still arrives")
-    (is (= [false true] @seen)
-        "the cheap read came up short, so the batch was read again consistently")
+    (is (some true? @seen)
+        "a short cheap read was checked against the leader before believing it")
 
-    (testing "and a batch that is short even through the leader fails loudly"
+    (testing "and a stream that really has ended just ends"
       (reset! seen [])
       (reset! stale? false)
-      (let [always-short (store objects
-                                {:bundle-request
-                                 (fn [_store keys]
-                                   (memory-client/tar objects (butlast keys)))})]
-        (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo
-             #"fewer events than the stream holds"
-             (event-store/reduce-events always-short 0 conj [])))))))
+      (is (= [] (into [] (event-store/events s 9))))
+      (is (= [true] @seen)
+          "one key, asked of the leader, and the answer is final"))))
 
-(deftest f-stopping-early-is-not-mistaken-for-a-short-batch
+(deftest f-stopping-early-is-not-mistaken-for-the-end
   (let [objects (objects)
         seen (atom [])
         s (store objects {:bundle-request (fn [store keys]
@@ -351,12 +380,12 @@
                                             (memory-client/tar objects keys))})]
     (append-range! s 0 8)
     (is (= (mapv event (range 2))
-           (event-store/reduce-events s 0
-                                      (fn [acc e]
-                                        (if (= 2 (count acc)) (reduced acc) (conj acc e)))
-                                      [])))
-    (is (= [false] @seen)
-        "`f` ending it is ordinary, so there is nothing to re-read")))
+           (reduce (fn [acc e] (if (= 2 (count acc)) (reduced acc) (conj acc e)))
+                   []
+                   (event-store/events s 0))))
+    (is (= [true false] @seen)
+        "the one-key batch, then a relaxed batch of two that `f` ended. Ending
+         it is ordinary, so nothing is checked with the leader.")))
 
 (deftest keys-too-long-for-ustar-still-replay
   ;; Tigris picks the tar dialect by key length: a key that fits is a plain
@@ -376,9 +405,9 @@
           key-length (+ prefix-length (count "/events/") 19)]
       (append-range! s 0 3)
       (is (= (mapv event (range 3))
-             (event-store/reduce-events s 0 conj []))
+             (into [] (event-store/events s 0)))
           (str "keys of " key-length " characters"))
-      (is (= (event 1) (event-store/get-event s 1))))))
+      (is (= (event 1) (reduce (fn [_ e] (reduced e)) nil (event-store/events s 1)))))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'simplemono.event-store.tigris-test)]

@@ -1,5 +1,6 @@
 (ns simplemono.event-store.memory
-  "`simplemono.event-store/EventStore` in memory.
+  "`simplemono.event-store/EventAppend`, `EventSource` and `EventHead` in
+   memory.
 
    One store is one stream, held in an atom over a sorted map from event
    number to event. Nothing is persisted and nothing is shared between stores.
@@ -12,7 +13,8 @@
    create-only, gap-free behaviour an object store gives them. Unlike a store
    reached over a network, an append here either happened or threw, so there is
    never an uncertain write to resolve."
-  (:require [simplemono.event-store :as event-store]))
+  (:require [simplemono.event-store :as event-store]
+            [simplemono.event-store.util :as util]))
 
 (defn- gap!
   [event-number expected]
@@ -29,7 +31,7 @@
                      :event-number event-number}))))
 
 (defrecord MemoryEventStore [state]
-  event-store/EventStore
+  event-store/EventAppend
   (try-append! [_ event-number event]
     (check-event-number! event-number)
     (let [event-number (long event-number)]
@@ -50,9 +52,13 @@
               (swap! state assoc event-number event)
               true))))))
 
-  (get-event [_ event-number]
-    (get @state (long event-number)))
+  event-store/EventSource
+  (events [_ from]
+    ;; Reading one event from a map costs what reading a hundred does, so the
+    ;; generic walk is also the fastest one available here.
+    (util/one-at-a-time #(get @state (long %)) from))
 
+  event-store/EventHead
   (latest-event-number [_]
     (last (keys @state))))
 
@@ -75,7 +81,7 @@
   (event-store/try-append! s 0 {:event/type :example/created})
   (event-store/try-append! s 0 {:event/type :example/created})
 
-  (event-store/get-event s 0)
+  (into [] (event-store/events s 0))
   (event-store/latest-event-number s)
 
   ;; Seed a stream and look at it:
