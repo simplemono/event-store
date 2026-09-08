@@ -197,9 +197,11 @@ away, so that one is caught by the count instead: the batch was bounded by the
 head, so a short count the leader confirms means the events are gone. Nothing
 ever deletes an event, so that is corruption rather than a race, and it throws.
 
-Only the opening single key may legitimately come back empty. That is not
-bounded by anything, and an empty answer is how a replay learns the stream ends
-there.
+Only an end probe — the opening key or a key past the known head — may
+legitimately come back empty. That key is not bounded by the head, and an empty
+answer is how replay learns the stream ends there. A one-key batch *within* the
+head's bound is different: it is already read through the leader, so an empty
+result throws immediately without another request.
 
 ### Measured
 

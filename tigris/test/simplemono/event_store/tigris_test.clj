@@ -384,6 +384,50 @@
       (is (= [99 100] [(:got (ex-data t)) (:expected (ex-data t))])
           "and says how much of the batch arrived against what was asked"))))
 
+(deftest a-missing-promised-singleton-is-not-mistaken-for-the-end
+  (doseq [[from total expected-requests]
+          [[0 2 [[1 true] [1 true]]]
+           [1 3 [[1 true] [1 true]]]
+           [0 102 [[1 true] [100 false] [1 true]]]]]
+    (testing (str "replaying " total " events from " from)
+      (let [objects (objects)
+            missing-key (str "org/acme/events/" (- Long/MAX_VALUE (dec total)))
+            requests (atom [])
+            delivered (atom [])
+            s (store objects
+                     {:bundle-request
+                      (fn [store keys]
+                        (swap! requests conj [(count keys)
+                                              (= "true" (get (:headers store) "X-Tigris-Consistent"))])
+                        ;; Delete only when the bounded singleton is fetched,
+                        ;; after the head LIST has already promised it exists.
+                        (when (= [missing-key] keys)
+                          (swap! objects dissoc missing-key))
+                        (memory-client/tar objects keys))})]
+        (append-range! s 0 total)
+        (let [t (try
+                  (reduce (fn [_ e] (swap! delivered conj e))
+                          nil (event-store/events s from))
+                  (catch clojure.lang.ExceptionInfo t t))]
+          (is (instance? clojure.lang.ExceptionInfo t))
+          (is (= {:error :missing-event :expected 1 :got 0 :from missing-key}
+                 (ex-data t)))
+          (is (= (mapv event (range from (dec total))) @delivered))
+          (is (= expected-requests @requests)
+              "the singleton was already read consistently; no retry is needed"))))))
+
+(deftest a-bounded-singleton-can-stop-reduction
+  (let [objects (objects)
+        requests (atom [])
+        s (store objects {:bundle-request (fn [_ keys]
+                                            (swap! requests conj (count keys))
+                                            (memory-client/tar objects keys))})]
+    (append-range! s 0 2)
+    (is (= [(event 0) (event 1)]
+           (into [] (take 2) (event-store/events s 0))))
+    (is (= [1 1] @requests)
+        "reduced on the bounded singleton avoids the final end probe")))
+
 (deftest headers-the-jdk-owns-are-not-copied-onto-the-request
   ;; The signer returns Host because it is signed, and the JDK's HttpClient
   ;; throws IllegalArgumentException rather than let a caller set it. The JDK
@@ -425,10 +469,9 @@
          discover relaxed and 9ms through the leader.")))
 
 (deftest a-short-batch-is-read-again-through-the-leader
-  ;; A short batch is normally the end of the stream, and that is how a replay
-  ;; finds it. But it can also be a replica that has not caught up, and
-  ;; stopping there would silently truncate the replay. The re-read tells the
-  ;; two apart: if the leader has more, keep going.
+  ;; A bounded batch cannot legitimately end early. Replica lag can make it
+  ;; short, so ask the leader for the missing suffix without redelivering the
+  ;; events already passed to the reducing function.
   (let [objects (objects)
         seen (atom [])
         stale? (atom true)

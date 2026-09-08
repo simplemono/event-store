@@ -392,45 +392,36 @@
   (update store :headers dissoc (key (first consistent-header))))
 
 (defn- fetch-batch
-  "One batch, read the cheap way, and ask the leader about the rest when the
-   cheap read came up short for a reason `f` did not cause.
+  "Read a batch whose keys the head has promised exist. A short relaxed read
+   is checked with the leader; a short consistent read throws unless `f`
+   stopped early. This also applies to a batch containing just one key.
 
-   A short batch has two innocent explanations and one bad one. `f` may have
-   stopped. The stream may end inside the batch, which is how a replay finds
-   the end at all. Or a replica has not caught up, and stopping there would
-   silently truncate the replay. The second read tells the last two apart: if
-   the leader has nothing more either, the stream really does end there.
+   Only the missing suffix is read again, carrying on from the accumulator
+   already produced. Re-reading the whole batch would hand `f` the same events
+   twice, and discarding the accumulator would not undo side effects or the
+   transients used by `into` and `transduce`.
 
-   It asks only for the keys the first read did not return, and carries on from
-   the accumulator it produced. Re-reading the whole batch would hand `f` the
-   same events twice, which is fine for `conj` on a vector and wrong for
-   anything with state — and `into` and `transduce` use transients, so
-   discarding the accumulator would not undo it."
+   End probes are separate: `replay` calls `reduce-bundle` directly for a key
+   not yet promised by the head, where an empty answer is legitimate."
   [store keys f init]
-  (let [;; The first batch of a replay is one key, and the leader premium is a
-        ;; few milliseconds on a response that size. Reading it through the
-        ;; leader makes the answer final, so an idle replay — the call that
-        ;; runs most often — is one request rather than one and a re-read.
-        first-read (if (= 1 (count keys)) (consistent store) (relaxed store))
-        {:keys [acc read stopped?] :as cheap} (reduce-bundle first-read keys f init)]
-    (if (or stopped?
-            (= read (count keys))
-            (= 1 (count keys)))
-      cheap
-      (let [rest-keys (vec (drop read keys))
-            {:keys [acc read stopped?]} (reduce-bundle (consistent store) rest-keys f acc)
-            total (+ (long (:read cheap)) (long read))]
-        (when-not (or stopped? (= total (count keys)))
-          ;; Every key here was promised by a consistent LIST of the head, and
-          ;; the leader has now been asked directly. There is no innocent
-          ;; reading left: the events are gone. Returning the short count would
-          ;; end the replay quietly and lose everything after the hole.
-          (throw (ex-info "The stream is missing events the head promised"
-                          {:error :missing-event
-                           :expected (count keys)
-                           :got total
-                           :from (first keys)})))
-        {:acc acc :read total :stopped? stopped?}))))
+  (let [single? (= 1 (count keys))
+        first-read (if single? (consistent store) (relaxed store))
+        {:keys [acc read stopped?] :as cheap} (reduce-bundle first-read keys f init)
+        result (if (or stopped? (= read (count keys)) single?)
+                 ;; A singleton has already been asked of the leader.
+                 cheap
+                 (let [rest-keys (vec (drop read keys))
+                       {:keys [acc read stopped?]} (reduce-bundle (consistent store) rest-keys f acc)]
+                   {:acc acc
+                    :read (+ (long (:read cheap)) (long read))
+                    :stopped? stopped?}))]
+    (when-not (or (:stopped? result) (= (:read result) (count keys)))
+      (throw (ex-info "The stream is missing events the head promised"
+                      {:error :missing-event
+                       :expected (count keys)
+                       :got (:read result)
+                       :from (first keys)})))
+    result))
 
 (def ^:private max-batch-size
   "The most events one request asks for.
@@ -478,7 +469,7 @@
       (or (nil? latest)
           (> event-number (long latest)))
       (let [{:keys [acc read stopped?]}
-            (fetch-batch store [(event-key prefix event-number)] f acc)]
+            (reduce-bundle (consistent store) [(event-key prefix event-number)] f acc)]
         (cond
           stopped? @acc
           (zero? (long read)) acc
@@ -488,10 +479,9 @@
       (let [size (min max-batch-size (- (inc (long latest)) event-number))
             keys (bundle-keys prefix event-number (dec (+ event-number size)))
             {:keys [acc read stopped?]} (fetch-batch store keys f acc)]
-        (cond
-          stopped? @acc
-          (< (long read) size) acc
-          :else (recur (+ event-number (long read)) acc latest))))))
+        (if stopped?
+          @acc
+          (recur (+ event-number (long read)) acc latest))))))
 
 (defrecord TigrisEventStore [client bucket prefix headers endpoint region
                              credentials-provider http-client bundle-request
