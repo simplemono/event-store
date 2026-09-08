@@ -28,6 +28,9 @@
   (try-append! [store event-number event]
     "Create-only append of `event` at zero-based `event-number`.
 
+     `event-number` must be a non-negative java.lang.Long. Other numeric types
+     are not coerced. Long/MAX_VALUE is the last addressable position.
+
      Returns true when this invocation wrote the event, including its retries,
      and false when another invocation owns `event-number`, even if the event
      values are equal.
@@ -53,8 +56,13 @@
        (reduce f init (events store 0))
        (transduce (filter interesting?) conj [] (events store 42))
 
-     The walk stops at the first event number that does not exist, and `f` may
-     return `reduced` to stop sooner.
+     `from` must be a non-negative java.lang.Long, just like an append position.
+     Invalid positions throw ex-info with {:error :incorrect} when `events` is
+     called, before any reading or reduction begins.
+
+     The walk stops at the first event number that does not exist or after
+     Long/MAX_VALUE, and `f` may return `reduced` to stop sooner. Stored nil and
+     false are events, not end-of-stream markers.
 
      What comes back is reducible and deliberately not seqable. An
      implementation may hold a connection or an archive open while it reads,
@@ -67,7 +75,7 @@
 
 (defprotocol EventHead
   (latest-event-number [store]
-    "The highest event number in the stream, or nil when it is empty.
+    "The highest event number in the stream as a java.lang.Long, or nil when empty.
 
      Nothing in this library needs it: a replay finds the end of a stream by
      walking off it, and an append is told its number by the caller, normally

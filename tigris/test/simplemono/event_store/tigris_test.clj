@@ -1,6 +1,7 @@
 (ns simplemono.event-store.tigris-test
   (:require [clojure.test :refer [deftest is run-tests testing]]
             [simplemono.event-store :as event-store]
+            [simplemono.event-store.contract :as contract]
             [simplemono.event-store.memory-client :as memory-client]
             [simplemono.event-store.tigris :as tigris]
             [simplemono.event-store.tigris.bundle :as bundle]
@@ -48,6 +49,21 @@
     (is (true? (event-store/try-append! s n (event n)))
         (str "appended event " n))))
 
+(deftest positions-are-non-negative-java-longs
+  (contract/positions! #(store (objects))))
+
+(deftest nil-events-replay-without-truncation
+  (contract/nil-events! #(store (objects))))
+
+(deftest the-long-range-is-fully-supported
+  (contract/long-limit!
+   (fn [initial]
+     (store (atom (into (sorted-map)
+                        (map (fn [[n value]]
+                               [(str "org/acme/events/" (format "%019d" (- Long/MAX_VALUE n)))
+                                (codec/encode value)]))
+                        initial))))))
+
 (deftest appends-are-create-only-and-gap-free
   (let [objects (objects)
         s (store objects)]
@@ -56,10 +72,6 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
                             #"Append would create a gap"
                             (event-store/try-append! s 1 (event 1)))))
-    (testing "negative numbers are rejected"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                            #"Event numbers are zero-based"
-                            (event-store/try-append! s -1 (event 0)))))
     (is (true? (event-store/try-append! s 0 (event 0))))
     (testing "losing the race is a false, not an exception"
       (is (false? (event-store/try-append! s 0 (event 0)))))

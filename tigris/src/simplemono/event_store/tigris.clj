@@ -304,17 +304,13 @@
    a Class A operation on object stores such as Tigris while HEAD is Class B,
    roughly ten times cheaper."
   [{:keys [prefix] :as store} event-number event]
-  (let [event-number (long event-number)]
-    (when (neg? event-number)
-      (throw (ex-info "Event numbers are zero-based"
-                      {:error :incorrect
-                       :event-number event-number})))
-    (if (or (zero? event-number)
-            (some? (object-metadata store (event-key prefix (dec event-number)))))
-      (put! store
-            (event-key prefix event-number)
-            (codec/encode event))
-      (gap! event-number))))
+  (util/check-event-number! event-number)
+  (if (or (zero? event-number)
+          (some? (object-metadata store (event-key prefix (dec event-number)))))
+    (put! store
+          (event-key prefix event-number)
+          (codec/encode event))
+    (gap! event-number)))
 
 (defn- print-retry
   [{:keys [op key attempt ^Throwable exception]}]
@@ -324,9 +320,9 @@
                   (.getMessage exception)))))
 
 (defn- bundle-keys
-  "The keys for events [from, to], inclusive."
-  [prefix from to]
-  (mapv #(event-key prefix %) (range (long from) (inc (long to)))))
+  "The keys for a batch of `size` events starting at `from`."
+  [prefix from size]
+  (mapv #(event-key prefix (+ (long from) %)) (range size)))
 
 (defn- reduce-bundle
   "Reduce `f` over the events at `keys`, in the order asked for. Returns
@@ -457,16 +453,19 @@
             (reduce-bundle (consistent store) [(event-key prefix event-number)] f acc)]
         (cond
           stopped? @acc
-          (zero? (long read)) acc
+          (or (zero? (long read)) (= event-number Long/MAX_VALUE)) acc
           :else (recur (inc event-number) acc (head store))))
 
       :else
-      (let [size (min max-batch-size (- (inc (long latest)) event-number))
-            keys (bundle-keys prefix event-number (dec (+ event-number size)))
-            {:keys [acc read stopped?]} (fetch-batch store keys f acc)]
-        (if stopped?
-          @acc
-          (recur (+ event-number (long read)) acc latest))))))
+      ;; Subtract before incrementing, so a head at Long/MAX_VALUE is safe.
+      (let [size (inc (min (dec max-batch-size) (- (long latest) event-number)))
+            last-number (+ event-number (dec size))
+            keys (bundle-keys prefix event-number size)
+            {:keys [acc stopped?]} (fetch-batch store keys f acc)]
+        (cond
+          stopped? @acc
+          (= last-number Long/MAX_VALUE) acc
+          :else (recur (inc last-number) acc latest))))))
 
 (defrecord TigrisEventStore [client bucket prefix headers endpoint region
                              credentials-provider http-client bundle-request
@@ -477,6 +476,7 @@
 
   event-store/EventSource
   (events [this from]
+    (util/check-event-number! from)
     (util/reducible
      (fn [rf init]
        (replay this from rf init))))

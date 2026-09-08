@@ -87,6 +87,14 @@ returns `true` when the event was written and `false` when another writer
 already took that number. It throws `{:error :gap}` when the previous event is
 missing and `{:error :incorrect}` when the number is not a valid one.
 
+Append numbers and replay's `from` must be non-negative **`java.lang.Long`**
+values. Ordinary Clojure integer literals such as `42` and explicit `(long 42)`
+qualify; `42N`, `BigInteger`, `(int 42)`, floating-point values, strings, `nil`, and
+negatives do not. There is no coercion. Invalid positions fail before storage
+access; `events` checks its argument immediately, not when reduction starts.
+This restriction applies to positions, not numeric values inside an event.
+`Long/MAX_VALUE` is the final position; replay stops there without overflowing.
+
 The caller chooses the number, which is normally its read-model cursor plus
 one. A `false` therefore means the state the caller decided on has moved, and
 the right response is to catch the read model up and decide again:
@@ -334,7 +342,9 @@ inspect one. Appends are serialised, so concurrent writers see the same
 create-only, gap-free behaviour Tigris gives them. Reading one event from a map
 costs what reading a hundred does, so `events` there is the generic walk in
 `simplemono.event-store.util/one-at-a-time`, which any implementation can use in
-a line.
+a line. The helper's callback returns a map entry, as `find` does, or nil when
+absent. A stored nil (or false) is therefore replayed as an event rather than
+mistaken for the end of the stream.
 
 What it cannot reproduce is a network: there is no retrying and no uncertain
 write, because an append here either happened or threw.
@@ -352,7 +362,9 @@ the bundle API. They are fakes of the transport, not of the store, so the suite
 exercises the real code — the same key encoding, inverted ordering, Nippy codec,
 create-only put, retrying and tar parsing — with only the network missing. The
 same command runs codec tests, including the frozen compatibility fixtures in
-`tigris/test/fixtures/`.
+`tigris/test/fixtures/`. Both backends also run the shared assertions in
+`core/test/` for strict position types, stored nil/false values, and append/replay
+at the Long boundary. That shared suite is a test-only dependency.
 
 The fake writes its archives with Commons Compress in POSIX long-file mode, so
 a long key becomes a pax extended header there as it does on Tigris. It is not
