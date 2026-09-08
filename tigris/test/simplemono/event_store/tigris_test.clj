@@ -3,10 +3,10 @@
             [simplemono.event-store :as event-store]
             [simplemono.event-store.memory-client :as memory-client]
             [simplemono.event-store.tigris :as tigris]
-            [simplemono.event-store.tigris.bundle :as bundle])
-  (:import (java.io ByteArrayInputStream)
-           (java.util.zip GZIPInputStream)
-           (software.amazon.awssdk.core ResponseInputStream)
+            [simplemono.event-store.tigris.bundle :as bundle]
+            [simplemono.event-store.tigris.codec :as codec]
+            [simplemono.event-store.tigris.codec-test])
+  (:import (software.amazon.awssdk.core ResponseInputStream)
            (software.amazon.awssdk.core.exception SdkClientException)
            (software.amazon.awssdk.core.sync RequestBody)
            (software.amazon.awssdk.services.s3 S3Client)
@@ -42,11 +42,6 @@
             :bundle-request (fn [_store keys] (memory-client/tar objects keys))}
            overrides))))
 
-(defn- gunzip
-  [bytes]
-  (with-open [gzip (GZIPInputStream. (ByteArrayInputStream. bytes))]
-    (slurp gzip :encoding "UTF-8")))
-
 (defn- append-range!
   [s from to]
   (doseq [n (range from to)]
@@ -74,16 +69,46 @@
     (is (= [(event 1)] (into [] (event-store/events s 1))))
     (is (= [] (into [] (event-store/events s 2))))))
 
-(deftest objects-use-inverted-gzip-edn-keys
+(deftest objects-use-inverted-nippy-keys
   (let [objects (objects)
-        s (store objects)]
+        ^S3Client delegate (memory-client/client objects)
+        requests (atom [])
+        client (reify S3Client
+                 (^PutObjectResponse putObject [_ ^PutObjectRequest request ^RequestBody body]
+                   (swap! requests conj [(.contentType request) (.contentEncoding request)])
+                   (.putObject delegate request body))
+                 (^HeadObjectResponse headObject [_ ^HeadObjectRequest request]
+                   (.headObject delegate request)))
+        s (store objects {:client client})]
     (append-range! s 0 2)
     (is (= ["org/acme/events/9223372036854775806"
             "org/acme/events/9223372036854775807"]
            (keys @objects))
         "the newest event sorts first, so the head is one maxKeys=1 LIST")
-    (is (= (pr-str (event 0))
-           (gunzip (get @objects "org/acme/events/9223372036854775807"))))))
+    (is (= [["application/octet-stream" nil] ["application/octet-stream" nil]] @requests))
+    (is (= (event 0)
+           (codec/decode (get @objects "org/acme/events/9223372036854775807"))))))
+
+(deftest event-payloads-do-not-depend-on-print-settings
+  (let [objects (objects)
+        s (store objects)
+        bytes (byte-array [-128 -1 0 1 127])
+        value {:nested [1 2 3 {:more #{:a :b}}] :bytes bytes}]
+    (binding [*print-length* 1 *print-level* 1 *print-dup* true]
+      (is (true? (event-store/try-append! s 0 value))))
+    (aset-byte bytes 0 (byte 42))
+    (let [actual (into [] (event-store/events s 0))]
+      (is (= 1 (count actual)))
+      (is (= (:nested value) (:nested (first actual))))
+      (is (= [-128 -1 0 1 127] (vec (:bytes (first actual))))
+          "the persisted bytes are independent of the caller's array"))))
+
+(deftest unsupported-event-values-never-reach-put
+  (let [objects (objects)
+        s (store objects {:on-retry (fn [_] (throw (AssertionError. "Encoding must not retry")))})]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unsupported event value"
+                          (event-store/try-append! s 0 {:nested [(Object.)]})))
+    (is (empty? @objects))))
 
 (defn- failing-put-client
   "Delegates to a memory client, but the first `failures` putObject calls throw
@@ -110,6 +135,19 @@
 
       (^ListObjectsV2Response listObjectsV2 [_ ^ListObjectsV2Request request]
         (.listObjectsV2 delegate request)))))
+
+(deftest append-retries-reuse-the-frozen-payload
+  (let [objects (objects)
+        payload (byte-array [1 2 3])
+        retries (atom 0)
+        s (store objects {:client (failing-put-client objects 1 false)
+                           :on-retry (fn [_]
+                                       (swap! retries inc)
+                                       (aset-byte payload 0 (byte 99)))})]
+    (is (true? (event-store/try-append! s 0 {:bytes payload})))
+    (is (= 1 @retries))
+    (is (= [1 2 3] (vec (:bytes (first (into [] (event-store/events s 0))))))
+        "retrying the PUT must not encode the caller's mutated array again")))
 
 (deftest transient-failures-are-retried-until-the-store-answers
   (testing "a put that fails twice and then succeeds still appends"
@@ -213,12 +251,12 @@
       (is (= 2 (count @ids)))
       (is (apply = @ids))
       (is (= [:put] @retries))
-      (is (= (pr-str (event 0)) (gunzip (first (vals @objs))))))))
+      (is (= (event 0) (codec/decode (first (vals @objs))))))))
 
 (deftest legacy-objects-without-write-metadata-are-not-ours
   (doseq [failures [0 1]]
     (let [key "org/acme/events/9223372036854775807"
-          ;; Deliberately not EDN or gzip: ownership must not inspect the body.
+          ;; Deliberately not Nippy: ownership must not inspect the body.
           bytes (byte-array [1 2 3])
           objs (atom (sorted-map key bytes))
           s (store objs {:client (failing-put-client objs failures false)
@@ -533,6 +571,7 @@
       (is (= (event 1) (reduce (fn [_ e] (reduced e)) nil (event-store/events s 1)))))))
 
 (defn -main [& _]
-  (let [{:keys [fail error]} (run-tests 'simplemono.event-store.tigris-test)]
+  (let [{:keys [fail error]} (run-tests 'simplemono.event-store.tigris-test
+                                      'simplemono.event-store.tigris.codec-test)]
     (when (pos? (+ fail error))
       (System/exit 1))))

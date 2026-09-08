@@ -3,8 +3,8 @@
 
    It is a fake transport rather than a second storage backend, so a test runs
    the real `simplemono.event-store` code: the same key encoding, the same
-   inverted ordering, the same gzip, the same create-only put and the same tar
-   parsing. Only the network is missing.
+   inverted ordering, the same payload codec, the same create-only put and the
+   same tar parsing. Only the network is missing.
 
    It implements putObject with If-None-Match, getObject, headObject and a
    prefix listing with maxKeys. `tar` stands in for the Tigris bundle API,

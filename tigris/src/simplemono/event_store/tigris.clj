@@ -4,7 +4,7 @@
 
    One store is one stream, under one prefix in one bucket:
 
-     {prefix}/events/{inverted-19d}   one gzip-EDN object per event
+     {prefix}/events/{inverted-19d}   one Nippy object per event
 
    Event numbers are zero-based and gap-free. `try-append!` is create-only: it
    returns true when the event was written and false when another writer
@@ -62,13 +62,11 @@
             [clojure.string :as str]
             [simplemono.event-store :as event-store]
             [simplemono.event-store.util :as util]
-            [simplemono.event-store.tigris.bundle :as bundle])
-  (:import (java.io ByteArrayInputStream ByteArrayOutputStream)
-           (java.net URI)
+            [simplemono.event-store.tigris.bundle :as bundle]
+            [simplemono.event-store.tigris.codec :as codec])
+  (:import (java.net URI)
            (java.net.http HttpClient)
-           (java.nio.charset StandardCharsets)
            (java.util.function Consumer)
-           (java.util.zip GZIPInputStream GZIPOutputStream)
            (software.amazon.awssdk.auth.credentials AwsBasicCredentials
                                                     DefaultCredentialsProvider
                                                     StaticCredentialsProvider)
@@ -135,13 +133,6 @@
     (let [segment (subs key (count prefix))]
       (when (re-matches (re-pattern (str "\\d{" number-width "}")) segment)
         (parse-number segment)))))
-
-(defn- gzip-bytes
-  [s]
-  (let [out (ByteArrayOutputStream.)]
-    (with-open [gzip (GZIPOutputStream. out)]
-      (.write gzip (.getBytes (str s) StandardCharsets/UTF_8)))
-    (.toByteArray out)))
 
 (defn- not-found?
   [^S3Exception e]
@@ -240,8 +231,7 @@
                     (.bucket bucket)
                     (.key key)
                     (.overrideConfiguration (override headers true))
-                    (.contentType "application/edn; charset=utf-8")
-                    (.contentEncoding "gzip")
+                    (.contentType "application/octet-stream")
                     (.metadata {"event-store-write-id" write-id})
                     (.build))
                 (RequestBody/fromBytes bytes))
@@ -323,7 +313,7 @@
             (some? (object-metadata store (event-key prefix (dec event-number)))))
       (put! store
             (event-key prefix event-number)
-            (gzip-bytes (pr-str event)))
+            (codec/encode event))
       (gap! event-number))))
 
 (defn- print-retry
@@ -337,11 +327,6 @@
   "The keys for events [from, to], inclusive."
   [prefix from to]
   (mapv #(event-key prefix %) (range (long from) (inc (long to)))))
-
-(defn- decode
-  [^bytes gzipped]
-  (with-open [gzip (GZIPInputStream. (ByteArrayInputStream. gzipped))]
-    (edn/read-string (slurp gzip :encoding "UTF-8"))))
 
 (defn- reduce-bundle
   "Reduce `f` over the events at `keys`, in the order asked for. Returns
@@ -372,7 +357,7 @@
                              {:error :missing-event
                               :expected expected
                               :got name})))
-           (let [acc (f acc (decode content))
+           (let [acc (f acc (codec/decode content))
                  state {:acc acc :read (inc (long read)) :stopped? (reduced? acc)}]
              (if (reduced? acc)
                (reduced state)

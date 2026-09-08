@@ -10,7 +10,7 @@ in one request.
 One store is one stream, under one prefix in one bucket:
 
 ```
-{prefix}/events/{inverted-19d}   one gzip-EDN object per event
+{prefix}/events/{inverted-19d}   one Nippy object per event
 ```
 
 That is the entire layout. There is nothing else to build, keep current or
@@ -25,7 +25,7 @@ digits), so the newest object sorts first and finding the head is one LIST with
 | module | namespace | depends on |
 | --- | --- | --- |
 | `core` | `simplemono.event-store` — the `EventAppend`, `EventSource` and `EventHead` protocols | nothing |
-| `tigris` | `simplemono.event-store.tigris` — the implementation | `core`, `awssdk/s3`, `commons-compress` |
+| `tigris` | `simplemono.event-store.tigris` — the implementation | `core`, `awssdk/s3`, `nippy`, `commons-compress` |
 | `memory` | `simplemono.event-store.memory` — an in-memory implementation | `core` |
 | `memory-client` | `simplemono.event-store.memory-client` — test doubles | `awssdk/s3`, `commons-compress` |
 
@@ -130,7 +130,8 @@ This also handles retries hidden inside the AWS SDK.
 Equal event values do not establish ownership: two independent writers can
 produce the same value. A new invocation gets a new ID, so repeating a successful
 append returns `false`, even with the same event. Existing objects without this
-metadata still replay normally and are treated as belonging to another invocation.
+metadata are treated as belonging to another invocation; replay requires the
+current payload format described below.
 The ID is internal, not a caller-supplied idempotency key for application retries
 or restarts.
 
@@ -207,13 +208,44 @@ result throws immediately without another request.
 
 Two hundred events on a real bucket: **four bundle requests and one LIST, about
 350ms**. An idle replay is one request. Reading one event by number is one
-request.
+request. The latency measurements above predate the Nippy switch: request counts
+are unchanged, but timings have not yet been remeasured with the new codec.
 
 ## Events
 
-Events must be EDN round-trippable values, and should stay small: a replay
-pulls up to a hundred of them in one response. Keep large payloads in a blob
+Tigris events are plain data: maps, vectors, lists/sequences, sets, keywords,
+symbols, strings, characters, numbers, booleans, and `nil`, plus UUIDs,
+`java.util.Date`, `java.time.Instant`, and byte arrays. Collection metadata is
+preserved and must follow the same rules. Sorted collections must use the default
+comparator; custom comparators are not persisted.
+
+Records, custom types, other JVM objects, and non-byte arrays are rejected with
+`{:error :incorrect}` before any PUT. Encoding never falls back to Java
+serialization, reader-based encoding, or placeholder values. This is a type
+boundary, not application event-schema validation. The in-memory backend does
+not serialize events or enforce this Tigris-specific codec boundary.
+
+Treat events as immutable, including contained byte arrays, and keep them small:
+a replay pulls up to a hundred in one response. Keep large payloads in a blob
 store and put the blob's name in the event.
+
+### Payload format and upgrades
+
+Each object is a regular [Nippy](https://github.com/taoensso/nippy) `freeze` frame,
+including its header, with automatic compression (`:compressor :auto`). There
+is no outer gzip layer. Objects use `application/octet-stream`, without an HTTP
+`Content-Encoding`; the Nippy header tells `thaw` how to decompress them.
+
+This is a clean storage-format break: there is no gzip-EDN or headerless Nippy
+decoder. Print settings and ambient Nippy codec bindings do not determine the
+stored event. Encoding happens once before PUT retries; there is no additional
+thaw/equality check on each append (byte arrays have identity equality).
+
+Nippy is pinned to **3.9.0**. Upgrade all readers and writers together, and run the
+compatibility tests against the checked-in frozen events before upgrading. Keep
+those fixtures unchanged and add new ones when adopting another version. Newer
+Nippy versions aim to read older frames; older readers are not guaranteed to read
+new writes, so rollback after an upgrade must be checked separately.
 
 ## Why single events, not commits
 
@@ -317,8 +349,10 @@ cd tigris && clojure -M:test
 The `tigris` suite runs against `memory-client`, which fakes the two transports
 this library uses: an in-memory `S3Client`, and a `tar` function standing in for
 the bundle API. They are fakes of the transport, not of the store, so the suite
-exercises the real code — the same key encoding, inverted ordering, gzip,
-create-only put, retrying and tar parsing — with only the network missing.
+exercises the real code — the same key encoding, inverted ordering, Nippy codec,
+create-only put, retrying and tar parsing — with only the network missing. The
+same command runs codec tests, including the frozen compatibility fixtures in
+`tigris/test/fixtures/`.
 
 The fake writes its archives with Commons Compress in POSIX long-file mode, so
 a long key becomes a pax extended header there as it does on Tigris. It is not
