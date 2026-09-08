@@ -39,6 +39,13 @@
                   (HttpTimeoutException. "Request timeout")
                   (ApiCallTimeoutException/create 100)
                   (ApiCallAttemptTimeoutException/create 100)
+                  ;; Request deadlines may use interruption internally. They
+                  ;; remain timeouts unless the caller's thread is interrupted.
+                  (ApiCallTimeoutException/create "Deadline" (InterruptedException. "SDK timer"))
+                  (SdkClientException/create "Wrapped deadline"
+                                             (ApiCallAttemptTimeoutException/create "Deadline" (InterruptedException. "SDK timer")))
+                  (doto (SocketTimeoutException. "Read deadline") (.initCause (InterruptedException. "Timer")))
+                  (doto (HttpTimeoutException. "Request deadline") (.initCause (InterruptedException. "Timer")))
                   (service-error 429) (service-error 500) (service-error 503)
                   (service-error 409)]
         remaining (atom failures)

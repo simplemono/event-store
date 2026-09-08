@@ -39,8 +39,10 @@
    I/O, SDK timeouts, 429 and 5xx. A conditional PUT's 409 is also retried, and
    its 412 is resolved by checking ownership. Other service errors and failures
    without transient evidence (such as missing credentials) are thrown at once.
-   Retries are announced through :on-retry, and the loop sleeps, so interrupting
-   the thread ends it.
+   Retries are announced through :on-retry. Thread interruption or a transport
+   cancellation stops the retry loop without wrapping the reported exception.
+   A cancelled append may already have landed: only a normal true/false return
+   guarantees a resolved outcome.
 
    Only acquiring a bundle stream is retried. Once it is open, failures reading,
    decoding or reducing propagate after closing the stream, even if no events
@@ -67,13 +69,17 @@
             [simplemono.event-store.util :as util]
             [simplemono.event-store.tigris.bundle :as bundle]
             [simplemono.event-store.tigris.codec :as codec])
-  (:import (java.net URI)
-           (java.net.http HttpClient)
+  (:import (java.io InterruptedIOException)
+           (java.net SocketTimeoutException URI)
+           (java.net.http HttpClient HttpTimeoutException)
+           (java.nio.channels ClosedByInterruptException)
+           (java.util.concurrent CancellationException)
            (java.util.function Consumer)
            (software.amazon.awssdk.auth.credentials AwsBasicCredentials
                                                     DefaultCredentialsProvider
                                                     StaticCredentialsProvider)
-           (software.amazon.awssdk.core.exception ApiCallAttemptTimeoutException
+           (software.amazon.awssdk.core.exception AbortedException
+                                                 ApiCallAttemptTimeoutException
                                                  ApiCallTimeoutException)
            (software.amazon.awssdk.core.sync RequestBody)
            (software.amazon.awssdk.regions Region)
@@ -146,6 +152,32 @@
   [t]
   (take-while some? (iterate #(.getCause ^Throwable %) t)))
 
+(defn- request-timeout?
+  [t]
+  (or (instance? ApiCallTimeoutException t)
+      (instance? ApiCallAttemptTimeoutException t)
+      (instance? SocketTimeoutException t)
+      (instance? HttpTimeoutException t)))
+
+(defn- cancellation?
+  [t]
+  (or (.isInterrupted (Thread/currentThread))
+      (some #(or (instance? InterruptedException %)
+                 (instance? CancellationException %)
+                 (instance? AbortedException %)
+                 (instance? ClosedByInterruptException %)
+                 ;; Subclasses can represent timeouts, e.g. Apache's connect
+                 ;; timeout, rather than thread interruption.
+                 (= InterruptedIOException (class %)))
+            ;; SDK request deadlines can use interruption internally. A timeout
+            ;; wrapper is authoritative unless the caller's thread is interrupted.
+            (take-while #(not (request-timeout? %)) (exception-chain t)))))
+
+(defn- check-interrupted!
+  []
+  (when (.isInterrupted (Thread/currentThread))
+    (throw (InterruptedException. "Event-store request interrupted"))))
+
 (defn- transient-failure?
   "Retry transport I/O, SDK timeouts, throttling and server errors. A generic
    SdkClientException is not sufficient evidence: missing credentials and bad
@@ -153,6 +185,8 @@
    its 412 is handled separately by checking write ownership."
   [op t]
   (cond
+    (cancellation? t) false
+
     (instance? S3Exception t)
     (let [status (.statusCode ^S3Exception t)]
       (or (= 429 status) (<= 500 status 599) (and (= op :put) (= 409 status))))
@@ -168,9 +202,7 @@
                       (instance? javax.net.ssl.SSLHandshakeException %)
                       (instance? javax.net.ssl.SSLPeerUnverifiedException %))
                  causes)
-       (some #(or (instance? java.io.IOException %)
-                  (instance? ApiCallTimeoutException %)
-                  (instance? ApiCallAttemptTimeoutException %))
+       (some #(or (instance? java.io.IOException %) (request-timeout? %))
              causes)))))
 
 (defn- retry-delay-ms
@@ -184,6 +216,7 @@
   "Announce the failed attempt, then sleep before the next one. Sleeping is
    what makes the loop interruptible: interrupting the thread ends it."
   [{:keys [on-retry]} op key attempt ^Throwable t]
+  (check-interrupted!)
   (on-retry {:op op
              :key key
              :attempt attempt
@@ -194,6 +227,7 @@
   "Call `thunk` until the object store answers, retrying transient failures."
   [store op key thunk]
   (loop [attempt 1]
+    (check-interrupted!)
     (let [outcome (try
                     {:value (thunk)}
                     (catch Throwable t
@@ -233,10 +267,9 @@
                                     (.key key)
                                     (.overrideConfiguration (override headers false))
                                     (.build))))))
-    (catch NoSuchKeyException _
-      nil)
     (catch S3Exception e
-      (if (not-found? e)
+      (if (and (not (cancellation? e))
+               (or (instance? NoSuchKeyException e) (not-found? e)))
         nil
         (throw e)))))
 
@@ -255,7 +288,7 @@
                 (RequestBody/fromBytes bytes))
     true
     (catch S3Exception e
-      (if (= 412 (.statusCode e))
+      (if (and (not (cancellation? e)) (= 412 (.statusCode e)))
         false
         (throw e)))))
 

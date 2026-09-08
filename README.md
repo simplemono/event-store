@@ -126,9 +126,8 @@ its 412 is resolved by checking ownership as described below.
 A generic SDK client exception does not establish a transient failure. Missing
 credentials, local-file configuration errors, TLS handshake/verification errors,
 and other failures without transient evidence are thrown rather than retried.
-Other HTTP service errors are terminal. The loop sleeps between attempts, so
-interrupting the thread ends it. `:on-retry` is called before each retry — replace
-it with your own logging, or an outage is indistinguishable from slowness.
+Other HTTP service errors are terminal. `:on-retry` is called before each retry —
+replace it with your own logging, or an outage is indistinguishable from slowness.
 
 Retrying an append is safe because the put is create-only. Each `try-append!`
 invocation generates a fresh UUID, stored as `event-store-write-id` in object
@@ -144,6 +143,21 @@ metadata are treated as belonging to another invocation; replay requires the
 current payload format described below.
 The ID is internal, not a caller-supplied idempotency key for application retries
 or restarts.
+
+### Cancellation and append outcomes
+
+The retry loop checks for thread interruption before starting a request or
+announcing a retry. Interruption during backoff ends the loop; interruption or
+cancellation reported by the transport propagates without a library-specific
+wrapper and is never retried or converted to `false`. Request timeouts are still
+retryable: an SDK deadline can use interruption internally without the caller
+having cancelled the operation.
+
+Only a **normal `true` or `false` return** guarantees a resolved append outcome.
+An exceptional exit — including cancellation — may leave the event committed.
+Catch up application state before deciding what to do next; an exception does
+not prove that nothing was written. The internal write ID identifies one
+invocation's retries, not a later invocation after cancellation or restart.
 
 ### Partial replay
 

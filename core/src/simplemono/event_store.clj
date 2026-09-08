@@ -41,10 +41,12 @@
        :gap        appending here would leave a hole, because the previous
                    event does not exist
 
-     Beyond those, an implementation may throw whatever its storage throws when
-     the storage itself is misconfigured or broken. It may not, however, hand
-     the caller an append whose outcome is unknown: resolving that is the
-     implementation's job, because only it knows what it wrote and where.
+     Beyond those, an implementation may throw whatever its storage throws.
+     Only a normal true/false return guarantees a resolved append outcome.
+     An exceptional exit, including interruption or cancellation, may occur
+     after the event was written. Cancellation is propagated, not retried or
+     converted to false. Catch up application state before deciding what to do
+     after an exceptional append; do not assume that nothing was written.
 
      An event must be a value the implementation can store and read back
      unchanged. Write ownership is separate from event equality."))
