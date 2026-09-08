@@ -6,7 +6,8 @@
             [simplemono.event-store.tigris :as tigris]
             [simplemono.event-store.tigris.bundle :as bundle]
             [simplemono.event-store.tigris.codec :as codec]
-            [simplemono.event-store.tigris.codec-test])
+            [simplemono.event-store.tigris.codec-test]
+            [simplemono.event-store.tigris.retry-test])
   (:import (software.amazon.awssdk.core ResponseInputStream)
            (software.amazon.awssdk.core.exception SdkClientException)
            (software.amazon.awssdk.core.sync RequestBody)
@@ -136,7 +137,7 @@
             (swap! remaining dec)
             (when store-it?
               (.putObject delegate request body))
-            (throw (SdkClientException/create "Connection reset")))
+            (throw (SdkClientException/create "Connection reset" (java.net.SocketException. "Connection reset"))))
           (.putObject delegate request body)))
 
       (^ResponseInputStream getObject [_ ^GetObjectRequest _request]
@@ -216,7 +217,7 @@
                            (if hidden-retry?
                              ;; The first response the caller sees is a 412.
                              (.putObject writer request body)
-                             (throw (SdkClientException/create "Connection reset"))))
+                             (throw (SdkClientException/create "Connection reset" (java.net.SocketException. "Connection reset")))))
                          (.putObject writer request body)))
                      (^HeadObjectResponse headObject [_ ^HeadObjectRequest request]
                        (swap! heads conj (get (-> request .overrideConfiguration (.orElseThrow) .headers)
@@ -584,6 +585,7 @@
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'simplemono.event-store.tigris-test
-                                      'simplemono.event-store.tigris.codec-test)]
+                                      'simplemono.event-store.tigris.codec-test
+                                      'simplemono.event-store.tigris.retry-test)]
     (when (pos? (+ fail error))
       (System/exit 1))))

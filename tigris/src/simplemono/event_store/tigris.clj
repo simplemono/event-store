@@ -35,13 +35,12 @@
    it missed are asked of the leader, and if they are still not there the
    replay throws rather than ending quietly, because the head promised them.
 
-   Transient failures never reach the caller. Every request is retried, with
-   backoff, until Tigris answers: a client-side exception, a 429 or a 5xx means
-   try again. A conditional PUT's 409 is also retried, and its 412 is resolved
-   by checking ownership. Other 4xx responses are thrown at once, so a bad key
-   or a missing bucket fails loudly instead of hanging forever. Retries are
-   announced through :on-retry, and the loop sleeps, so interrupting the thread
-   ends it.
+   Transient request failures are retried indefinitely with backoff: transport
+   I/O, SDK timeouts, 429 and 5xx. A conditional PUT's 409 is also retried, and
+   its 412 is resolved by checking ownership. Other service errors and failures
+   without transient evidence (such as missing credentials) are thrown at once.
+   Retries are announced through :on-retry, and the loop sleeps, so interrupting
+   the thread ends it.
 
    Retrying an append is safe because the put is create-only. What a retry
    cannot see by itself is whether the attempt that failed had in fact landed:
@@ -70,7 +69,8 @@
            (software.amazon.awssdk.auth.credentials AwsBasicCredentials
                                                     DefaultCredentialsProvider
                                                     StaticCredentialsProvider)
-           (software.amazon.awssdk.core.exception SdkClientException)
+           (software.amazon.awssdk.core.exception ApiCallAttemptTimeoutException
+                                                 ApiCallTimeoutException)
            (software.amazon.awssdk.core.sync RequestBody)
            (software.amazon.awssdk.regions Region)
            (software.amazon.awssdk.services.s3 S3Client)
@@ -138,22 +138,36 @@
   [^S3Exception e]
   (= 404 (.statusCode e)))
 
-(defn- transient-failure?
-  "True when the object store may answer differently next time. A client-side
-   exception is a network or timeout problem, 429 is throttling and 5xx is the
-   store's own trouble. Everything else — a bad key, a missing bucket, a
-   malformed request — is the caller's problem and must not be retried, or a
-   configuration error turns into a silent hang."
+(defn- exception-chain
   [t]
-  (or (instance? SdkClientException t)
-      ;; The bundle goes out over the JDK's HTTP client rather than the SDK, so
-      ;; its network failures arrive as IOException and its 5xx as an ex-info.
-      (instance? java.io.IOException t)
-      (= :unavailable (:error (ex-data t)))
-      (and (instance? S3Exception t)
-           (let [status (.statusCode ^S3Exception t)]
-             (or (= 429 status)
-                 (<= 500 status))))))
+  (take-while some? (iterate #(.getCause ^Throwable %) t)))
+
+(defn- transient-failure?
+  "Retry transport I/O, SDK timeouts, throttling and server errors. A generic
+   SdkClientException is not sufficient evidence: missing credentials and bad
+   configuration use that class too. Conditional PUT's 409 is retryable, but
+   its 412 is handled separately by checking write ownership."
+  [op t]
+  (cond
+    (instance? S3Exception t)
+    (let [status (.statusCode ^S3Exception t)]
+      (or (= 429 status) (<= 500 status 599) (and (= op :put) (= 409 status))))
+
+    (= :unavailable (:error (ex-data t))) true
+
+    :else
+    (let [causes (exception-chain t)]
+      (and
+       ;; These I/O failures need configuration changes, not more requests.
+       (not-any? #(or (instance? java.io.FileNotFoundException %)
+                      (instance? java.nio.file.FileSystemException %)
+                      (instance? javax.net.ssl.SSLHandshakeException %)
+                      (instance? javax.net.ssl.SSLPeerUnverifiedException %))
+                 causes)
+       (some #(or (instance? java.io.IOException %)
+                  (instance? ApiCallTimeoutException %)
+                  (instance? ApiCallAttemptTimeoutException %))
+             causes)))))
 
 (defn- retry-delay-ms
   "Exponential backoff from 100ms, capped at 30s, with jitter so that writers
@@ -179,7 +193,7 @@
     (let [outcome (try
                     {:value (thunk)}
                     (catch Throwable t
-                      (if (transient-failure? t)
+                      (if (transient-failure? op t)
                         {:failure t}
                         (throw t))))]
       (if-some [t (:failure outcome)]
@@ -248,23 +262,11 @@
    equal event values do not establish ownership. A 409 only means a write
    conflicted, not that the key exists, so it is retried."
   [store key bytes]
-  (let [write-id (str (random-uuid))]
-    (loop [attempt 1]
-      (let [outcome (try
-                      {:created? (put-once! store key bytes write-id)}
-                      (catch Throwable t
-                        (if (or (transient-failure? t)
-                                (and (instance? S3Exception t)
-                                     (= 409 (.statusCode ^S3Exception t))))
-                          {:failure t}
-                          (throw t))))]
-        (if-some [t (:failure outcome)]
-          (do
-            (await-retry! store :put key attempt t)
-            (recur (inc attempt)))
-          (or (:created? outcome)
-              (= write-id (get (object-metadata (consistent store) key)
-                               "event-store-write-id"))))))))
+  (let [write-id (str (random-uuid))
+        created? (with-retry store :put key #(put-once! store key bytes write-id))]
+    (or created?
+        (= write-id (get (object-metadata (consistent store) key)
+                         "event-store-write-id")))))
 
 (defn- newest-number
   "The highest number under `prefix`, or nil when the prefix is empty. One LIST

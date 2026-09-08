@@ -155,6 +155,6 @@
         (.body response)
         (let [message (slurp (.body response) :encoding "UTF-8")]
           (throw (ex-info "Bundle request failed"
-                          {:error (if (<= 500 status) :unavailable :incorrect)
+                          {:error (if (or (= 429 status) (<= 500 status 599)) :unavailable :incorrect)
                            :status status
                            :body message})))))))

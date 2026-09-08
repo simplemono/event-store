@@ -118,15 +118,17 @@ object stores such as Tigris while HEAD is Class B — roughly ten times cheaper
 
 ## Failure
 
-A transient failure never reaches the caller. Every request is retried, with
-exponential backoff and jitter, until the object store answers: a client-side
-exception, a 429 or a 5xx means try again. A conditional PUT's 409 is also
-retried; its 412 is resolved by checking ownership as described below. Other
-4xx responses mean the request itself is wrong and are thrown at once, so a
-bad key or a missing bucket fails loudly rather than hanging forever. The loop
-sleeps between attempts, so interrupting
-the thread ends it, and `:on-retry` is called before each attempt — replace it
-with your own logging, or an outage is indistinguishable from slowness.
+Transient request failures are retried **indefinitely**, with exponential backoff
+and jitter: transport I/O, SDK request timeouts, HTTP 429 and 5xx. There is no
+library retry deadline or attempt limit. A conditional PUT's 409 is also retried;
+its 412 is resolved by checking ownership as described below.
+
+A generic SDK client exception does not establish a transient failure. Missing
+credentials, local-file configuration errors, TLS handshake/verification errors,
+and other failures without transient evidence are thrown rather than retried.
+Other HTTP service errors are terminal. The loop sleeps between attempts, so
+interrupting the thread ends it. `:on-retry` is called before each retry — replace
+it with your own logging, or an outage is indistinguishable from slowness.
 
 Retrying an append is safe because the put is create-only. Each `try-append!`
 invocation generates a fresh UUID, stored as `event-store-write-id` in object
