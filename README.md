@@ -10,7 +10,7 @@ in one request.
 One store is one stream, under one prefix in one bucket:
 
 ```
-{prefix}/events/{inverted-19d}   one gzip-EDN object per event
+{prefix}/events/{inverted-19d}   one Nippy object per event
 ```
 
 That is the entire layout. There is nothing else to build, keep current or
@@ -25,7 +25,7 @@ digits), so the newest object sorts first and finding the head is one LIST with
 | module | namespace | depends on |
 | --- | --- | --- |
 | `core` | `simplemono.event-store` — the `EventAppend`, `EventSource` and `EventHead` protocols | nothing |
-| `tigris` | `simplemono.event-store.tigris` — the implementation | `core`, `awssdk/s3`, `commons-compress` |
+| `tigris` | `simplemono.event-store.tigris` — the implementation | `core`, `awssdk/s3`, `nippy`, `commons-compress` |
 | `memory` | `simplemono.event-store.memory` — an in-memory implementation | `core` |
 | `memory-client` | `simplemono.event-store.memory-client` — test doubles | `awssdk/s3`, `commons-compress` |
 
@@ -87,6 +87,14 @@ returns `true` when the event was written and `false` when another writer
 already took that number. It throws `{:error :gap}` when the previous event is
 missing and `{:error :incorrect}` when the number is not a valid one.
 
+Append numbers and replay's `from` must be non-negative **`java.lang.Long`**
+values. Ordinary Clojure integer literals such as `42` and explicit `(long 42)`
+qualify; `42N`, `BigInteger`, `(int 42)`, floating-point values, strings, `nil`, and
+negatives do not. There is no coercion. Invalid positions fail before storage
+access; `events` checks its argument immediately, not when reduction starts.
+This restriction applies to positions, not numeric values inside an event.
+`Long/MAX_VALUE` is the final position; replay stops there without overflowing.
+
 The caller chooses the number, which is normally its read-model cursor plus
 one. A `false` therefore means the state the caller decided on has moved, and
 the right response is to catch the read model up and decide again:
@@ -103,29 +111,67 @@ the right response is to catch the read model up and decide again:
 Deciding inside the loop is what makes this safe: a lost append re-runs the
 decision against fresh state instead of replaying a stale one.
 
-An append is one HEAD plus one PUT. The previous event is checked with HEAD
-rather than by listing the stream, because LIST is a Class A operation on
+An uncontended append is one HEAD plus one PUT (just the PUT for event zero).
+A 412 conflict adds a HEAD to identify the write that owns the number. HEAD is
+used rather than listing the stream because LIST is a Class A operation on
 object stores such as Tigris while HEAD is Class B — roughly ten times cheaper.
 
 ## Failure
 
-A transient failure never reaches the caller. Every request is retried, with
-exponential backoff and jitter, until the object store answers: a client-side
-exception, a 429 or a 5xx means try again. A 4xx means the request itself is
-wrong and is thrown at once, so a bad key or a missing bucket fails loudly
-rather than hanging forever. The loop sleeps between attempts, so interrupting
-the thread ends it, and `:on-retry` is called before each attempt — replace it
-with your own logging, or an outage is indistinguishable from slowness.
+Transient request failures are retried **indefinitely**, with exponential backoff
+and jitter: transport I/O, SDK request timeouts, HTTP 429 and 5xx. There is no
+library retry deadline or attempt limit. A conditional PUT's 409 is also retried;
+its 412 is resolved by checking ownership as described below.
 
-Retrying an append is safe because the put is create-only. What a retry cannot
-see by itself is whether the attempt that failed had in fact landed: a later
-attempt then finds the key taken and cannot tell our own write from somebody
-else's. Reading the object back settles it — an equal value was ours.
+A generic SDK client exception does not establish a transient failure. Missing
+credentials, local-file configuration errors, TLS handshake/verification errors,
+and other failures without transient evidence are thrown rather than retried.
+Other HTTP service errors are terminal. `:on-retry` is called before each retry —
+replace it with your own logging, or an outage is indistinguishable from slowness.
 
-That is why events must round-trip unchanged, and it is the reason there is no
-"the outcome is unknown" result. Resolving an uncertain write is the
-implementation's job, because only the implementation knows what it wrote and
-where. A `false` from `try-append!` always means somebody else won.
+Retrying an append is safe because the put is create-only. Each `try-append!`
+invocation generates a fresh UUID, stored as `event-store-write-id` in object
+metadata and kept unchanged across retries. On every 412, a strongly consistent
+HEAD compares that ID: the same ID means our write landed; a different or absent
+ID means another invocation owns the number. No event body is fetched or parsed.
+This also handles retries hidden inside the AWS SDK.
+
+Equal event values do not establish ownership: two independent writers can
+produce the same value. A new invocation gets a new ID, so repeating a successful
+append returns `false`, even with the same event. Existing objects without this
+metadata are treated as belonging to another invocation; replay requires the
+current payload format described below.
+The ID is internal, not a caller-supplied idempotency key for application retries
+or restarts.
+
+### Cancellation and append outcomes
+
+The retry loop checks for thread interruption before starting a request or
+announcing a retry. Interruption during backoff ends the loop; interruption or
+cancellation reported by the transport propagates without a library-specific
+wrapper and is never retried or converted to `false`. Request timeouts are still
+retryable: an SDK deadline can use interruption internally without the caller
+having cancelled the operation.
+
+Only a **normal `true` or `false` return** guarantees a resolved append outcome.
+An exceptional exit — including cancellation — may leave the event committed.
+Catch up application state before deciding what to do next; an exception does
+not prove that nothing was written. The internal write ID identifies one
+invocation's retries, not a later invocation after cancellation or restart.
+
+### Partial replay
+
+Only acquiring the bundle stream is retried. Once the stream is open, failures
+reading it, decoding events, or running the reducer propagate after the stream is
+closed. This applies even if the failure occurs before the first event is
+delivered. Reducer exceptions are never retried, including ones that happen to
+look like transient network errors.
+
+A failed reduction may already have processed a prefix. Those effects are not
+rolled back, and the library does not resume automatically. Resume explicitly
+from the last **durably committed projection cursor**, not merely the last event
+delivered to the reducer. Commit the projection changes and their cursor together;
+external side effects require their own idempotency.
 
 ## Replaying
 
@@ -190,21 +236,54 @@ away, so that one is caught by the count instead: the batch was bounded by the
 head, so a short count the leader confirms means the events are gone. Nothing
 ever deletes an event, so that is corruption rather than a race, and it throws.
 
-Only the opening single key may legitimately come back empty. That is not
-bounded by anything, and an empty answer is how a replay learns the stream ends
-there.
+Only an end probe — the opening key or a key past the known head — may
+legitimately come back empty. That key is not bounded by the head, and an empty
+answer is how replay learns the stream ends there. A one-key batch *within* the
+head's bound is different: it is already read through the leader, so an empty
+result throws immediately without another request.
 
 ### Measured
 
 Two hundred events on a real bucket: **four bundle requests and one LIST, about
 350ms**. An idle replay is one request. Reading one event by number is one
-request.
+request. The latency measurements above predate the Nippy switch: request counts
+are unchanged, but timings have not yet been remeasured with the new codec.
 
 ## Events
 
-Events must be EDN round-trippable values, and should stay small: a replay
-pulls up to a hundred of them in one response. Keep large payloads in a blob
+Tigris events are plain data: maps, vectors, lists/sequences, sets, keywords,
+symbols, strings, characters, numbers, booleans, and `nil`, plus UUIDs,
+`java.util.Date`, `java.time.Instant`, and byte arrays. Collection metadata is
+preserved and must follow the same rules. Sorted collections must use the default
+comparator; custom comparators are not persisted.
+
+Records, custom types, other JVM objects, and non-byte arrays are rejected with
+`{:error :incorrect}` before any PUT. Encoding never falls back to Java
+serialization, reader-based encoding, or placeholder values. This is a type
+boundary, not application event-schema validation. The in-memory backend does
+not serialize events or enforce this Tigris-specific codec boundary.
+
+Treat events as immutable, including contained byte arrays, and keep them small:
+a replay pulls up to a hundred in one response. Keep large payloads in a blob
 store and put the blob's name in the event.
+
+### Payload format and upgrades
+
+Each object is a regular [Nippy](https://github.com/taoensso/nippy) `freeze` frame,
+including its header, with automatic compression (`:compressor :auto`). There
+is no outer gzip layer. Objects use `application/octet-stream`, without an HTTP
+`Content-Encoding`; the Nippy header tells `thaw` how to decompress them.
+
+This is a clean storage-format break: there is no gzip-EDN or headerless Nippy
+decoder. Print settings and ambient Nippy codec bindings do not determine the
+stored event. Encoding happens once before PUT retries; there is no additional
+thaw/equality check on each append (byte arrays have identity equality).
+
+Nippy is pinned to **3.9.0**. Upgrade all readers and writers together, and run the
+compatibility tests against the checked-in frozen events before upgrading. Keep
+those fixtures unchanged and add new ones when adopting another version. Newer
+Nippy versions aim to read older frames; older readers are not guaranteed to read
+new writes, so rollback after an upgrade must be checked separately.
 
 ## Why single events, not commits
 
@@ -293,7 +372,9 @@ inspect one. Appends are serialised, so concurrent writers see the same
 create-only, gap-free behaviour Tigris gives them. Reading one event from a map
 costs what reading a hundred does, so `events` there is the generic walk in
 `simplemono.event-store.util/one-at-a-time`, which any implementation can use in
-a line.
+a line. The helper's callback returns a map entry, as `find` does, or nil when
+absent. A stored nil (or false) is therefore replayed as an event rather than
+mistaken for the end of the stream.
 
 What it cannot reproduce is a network: there is no retrying and no uncertain
 write, because an append here either happened or threw.
@@ -308,8 +389,12 @@ cd tigris && clojure -M:test
 The `tigris` suite runs against `memory-client`, which fakes the two transports
 this library uses: an in-memory `S3Client`, and a `tar` function standing in for
 the bundle API. They are fakes of the transport, not of the store, so the suite
-exercises the real code — the same key encoding, inverted ordering, gzip,
-create-only put, retrying and tar parsing — with only the network missing.
+exercises the real code — the same key encoding, inverted ordering, Nippy codec,
+create-only put, retrying and tar parsing — with only the network missing. The
+same command runs codec tests, including the frozen compatibility fixtures in
+`tigris/test/fixtures/`. Both backends also run the shared assertions in
+`core/test/` for strict position types, stored nil/false values, and append/replay
+at the Long boundary. That shared suite is a test-only dependency.
 
 The fake writes its archives with Commons Compress in POSIX long-file mode, so
 a long key becomes a pax extended header there as it does on Tigris. It is not

@@ -28,8 +28,12 @@
   (try-append! [store event-number event]
     "Create-only append of `event` at zero-based `event-number`.
 
-     Returns true when the event was written, and false when `event-number`
-     already exists — another writer won the race.
+     `event-number` must be a non-negative java.lang.Long. Other numeric types
+     are not coerced. Long/MAX_VALUE is the last addressable position.
+
+     Returns true when this invocation wrote the event, including its retries,
+     and false when another invocation owns `event-number`, even if the event
+     values are equal.
 
      Throws `ex-info` with `:error` in its `ex-data` for exceptional states:
 
@@ -37,14 +41,15 @@
        :gap        appending here would leave a hole, because the previous
                    event does not exist
 
-     Beyond those, an implementation may throw whatever its storage throws when
-     the storage itself is misconfigured or broken. It may not, however, hand
-     the caller an append whose outcome is unknown: resolving that is the
-     implementation's job, because only it knows what it wrote and where.
+     Beyond those, an implementation may throw whatever its storage throws.
+     Only a normal true/false return guarantees a resolved append outcome.
+     An exceptional exit, including interruption or cancellation, may occur
+     after the event was written. Cancellation is propagated, not retried or
+     converted to false. Catch up application state before deciding what to do
+     after an exceptional append; do not assume that nothing was written.
 
      An event must be a value the implementation can store and read back
-     unchanged, which is what lets an implementation settle an uncertain write
-     by comparing what is stored with what it meant to store."))
+     unchanged. Write ownership is separate from event equality."))
 
 (defprotocol EventSource
   (events [store from]
@@ -53,8 +58,13 @@
        (reduce f init (events store 0))
        (transduce (filter interesting?) conj [] (events store 42))
 
-     The walk stops at the first event number that does not exist, and `f` may
-     return `reduced` to stop sooner.
+     `from` must be a non-negative java.lang.Long, just like an append position.
+     Invalid positions throw ex-info with {:error :incorrect} when `events` is
+     called, before any reading or reduction begins.
+
+     The walk stops at the first event number that does not exist or after
+     Long/MAX_VALUE, and `f` may return `reduced` to stop sooner. Stored nil and
+     false are events, not end-of-stream markers.
 
      What comes back is reducible and deliberately not seqable. An
      implementation may hold a connection or an archive open while it reads,
@@ -62,12 +72,18 @@
      lazy sequence handed to a caller could not promise. Anyone who wants the
      whole stream in memory can still write `(into [] …)` and say so.
 
+     Failures while consuming an open stream, decoding events, or running `f`
+     propagate. A failed walk may already have delivered a prefix to `f`; those
+     effects are not rolled back or replayed automatically. The caller resumes from its last durably committed cursor,
+     which need not be the last event delivered. Commit projection updates and
+     their cursor together; external effects need their own idempotency.
+
      How the events are fetched is the store's business, because only the store
      knows what a request costs."))
 
 (defprotocol EventHead
   (latest-event-number [store]
-    "The highest event number in the stream, or nil when it is empty.
+    "The highest event number in the stream as a java.lang.Long, or nil when empty.
 
      Nothing in this library needs it: a replay finds the end of a stream by
      walking off it, and an append is told its number by the caller, normally

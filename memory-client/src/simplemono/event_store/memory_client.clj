@@ -3,12 +3,11 @@
 
    It is a fake transport rather than a second storage backend, so a test runs
    the real `simplemono.event-store` code: the same key encoding, the same
-   inverted ordering, the same gzip, the same create-only put and the same tar
-   parsing. Only the network is missing.
+   inverted ordering, the same payload codec, the same create-only put and the
+   same tar parsing. Only the network is missing.
 
-   It implements exactly the four operations the event store performs —
-   putObject with If-None-Match, getObject, headObject and a prefix listing
-   with maxKeys — and nothing else. `tar` stands in for the Tigris bundle API,
+   It implements putObject with If-None-Match, getObject, headObject and a
+   prefix listing with maxKeys. `tar` stands in for the Tigris bundle API,
    which is not an S3 operation at all."
   (:require [clojure.string :as str])
   (:import (java.io ByteArrayInputStream ByteArrayOutputStream)
@@ -61,29 +60,42 @@
 (defn client
   "An S3Client backed by `objects`, an atom holding a sorted map of key to
    byte array. Pass your own atom to inspect or seed the stored objects;
-   the zero-arity creates a fresh one."
+   the zero-arity creates a fresh one. Object metadata lives in the map's
+   metadata, so clients sharing the atom see both bytes and metadata together."
   ([]
    (client (atom (sorted-map))))
   ([objects]
    (reify S3Client
      (^PutObjectResponse putObject [_ ^PutObjectRequest request ^RequestBody body]
-       (let [key (.key request)]
-         (when (and (create-only? request)
-                    (contains? @objects key))
-           (throw (precondition-failed)))
-         (swap! objects assoc key (request-bytes body))
+       (let [key (.key request)
+             bytes (request-bytes body)]
+         (swap! objects
+                (fn [objects]
+                  (when (and (create-only? request) (contains? objects key))
+                    (throw (precondition-failed)))
+                  (-> objects
+                      (assoc key bytes)
+                      (vary-meta assoc-in [::metadata key] (into {} (.metadata request))))))
          (-> (PutObjectResponse/builder) (.build))))
 
      (^ResponseInputStream getObject [_ ^GetObjectRequest request]
-       (if-let [bytes (get @objects (.key request))]
-         (ResponseInputStream. (-> (GetObjectResponse/builder) (.build))
-                               (ByteArrayInputStream. bytes))
-         (throw (no-such-key))))
+       (let [objects @objects
+             key (.key request)]
+         (if-let [bytes (get objects key)]
+           (ResponseInputStream. (-> (GetObjectResponse/builder)
+                                     (.metadata (get-in (meta objects) [::metadata key] {}))
+                                     (.build))
+                                 (ByteArrayInputStream. bytes))
+           (throw (no-such-key)))))
 
      (^HeadObjectResponse headObject [_ ^HeadObjectRequest request]
-       (if (contains? @objects (.key request))
-         (-> (HeadObjectResponse/builder) (.build))
-         (throw (no-such-key))))
+       (let [objects @objects
+             key (.key request)]
+         (if (contains? objects key)
+           (-> (HeadObjectResponse/builder)
+               (.metadata (get-in (meta objects) [::metadata key] {}))
+               (.build))
+           (throw (no-such-key)))))
 
      (^ListObjectsV2Response listObjectsV2 [_ ^ListObjectsV2Request request]
        (let [prefix (or (.prefix request) "")

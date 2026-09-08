@@ -1,6 +1,7 @@
 (ns simplemono.event-store.memory-test
   (:require [clojure.test :refer [deftest is run-tests testing]]
             [simplemono.event-store :as event-store]
+            [simplemono.event-store.contract :as contract]
             [simplemono.event-store.memory :as memory]
             [simplemono.event-store.util :as util]))
 
@@ -10,6 +11,15 @@
    :event/type :example/happened
    :event/n n})
 
+(deftest positions-are-non-negative-java-longs
+  (contract/positions! memory/store))
+
+(deftest nil-events-replay-without-truncation
+  (contract/nil-events! memory/store))
+
+(deftest the-long-range-is-fully-supported
+  (contract/long-limit! #(memory/store (atom %))))
+
 (deftest appends-are-create-only-and-gap-free
   (let [s (memory/store)]
     (is (nil? (event-store/latest-event-number s)))
@@ -17,10 +27,6 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
                             #"Append would create a gap"
                             (event-store/try-append! s 1 (event 1)))))
-    (testing "negative numbers are rejected"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                            #"Event numbers are zero-based"
-                            (event-store/try-append! s -1 (event 0)))))
     (is (true? (event-store/try-append! s 0 (event 0))))
     (testing "losing the race is a false, not an exception"
       (is (false? (event-store/try-append! s 0 (event 0)))))

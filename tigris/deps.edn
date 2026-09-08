@@ -1,9 +1,11 @@
 {:paths ["src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         simplemono/event-store-core {:local/root "../core"}
+        com.taoensso/nippy {:mvn/version "3.9.0"}
         software.amazon.awssdk/s3 {:mvn/version "2.25.64"}
         org.apache.commons/commons-compress {:mvn/version "1.27.1"}}
  :aliases
  {:test {:extra-paths ["test"]
-         :extra-deps {simplemono/event-store-memory-client {:local/root "../memory-client"}}
+         :extra-deps {simplemono/event-store-memory-client {:local/root "../memory-client"}
+                      simplemono/event-store-contract-tests {:local/root "../core/test"}}
          :main-opts ["-m" "simplemono.event-store.tigris-test"]}}}

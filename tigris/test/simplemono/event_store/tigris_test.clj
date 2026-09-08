@@ -1,12 +1,16 @@
 (ns simplemono.event-store.tigris-test
   (:require [clojure.test :refer [deftest is run-tests testing]]
             [simplemono.event-store :as event-store]
+            [simplemono.event-store.contract :as contract]
             [simplemono.event-store.memory-client :as memory-client]
             [simplemono.event-store.tigris :as tigris]
-            [simplemono.event-store.tigris.bundle :as bundle])
-  (:import (java.io ByteArrayInputStream)
-           (java.util.zip GZIPInputStream)
-           (software.amazon.awssdk.core ResponseInputStream)
+            [simplemono.event-store.tigris.bundle :as bundle]
+            [simplemono.event-store.tigris.codec :as codec]
+            [simplemono.event-store.tigris.codec-test]
+            [simplemono.event-store.tigris.retry-test]
+            [simplemono.event-store.tigris.replay-failure-test]
+            [simplemono.event-store.tigris.cancellation-test])
+  (:import (software.amazon.awssdk.core ResponseInputStream)
            (software.amazon.awssdk.core.exception SdkClientException)
            (software.amazon.awssdk.core.sync RequestBody)
            (software.amazon.awssdk.services.s3 S3Client)
@@ -42,16 +46,26 @@
             :bundle-request (fn [_store keys] (memory-client/tar objects keys))}
            overrides))))
 
-(defn- gunzip
-  [bytes]
-  (with-open [gzip (GZIPInputStream. (ByteArrayInputStream. bytes))]
-    (slurp gzip :encoding "UTF-8")))
-
 (defn- append-range!
   [s from to]
   (doseq [n (range from to)]
     (is (true? (event-store/try-append! s n (event n)))
         (str "appended event " n))))
+
+(deftest positions-are-non-negative-java-longs
+  (contract/positions! #(store (objects))))
+
+(deftest nil-events-replay-without-truncation
+  (contract/nil-events! #(store (objects))))
+
+(deftest the-long-range-is-fully-supported
+  (contract/long-limit!
+   (fn [initial]
+     (store (atom (into (sorted-map)
+                        (map (fn [[n value]]
+                               [(str "org/acme/events/" (format "%019d" (- Long/MAX_VALUE n)))
+                                (codec/encode value)]))
+                        initial))))))
 
 (deftest appends-are-create-only-and-gap-free
   (let [objects (objects)
@@ -61,10 +75,6 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
                             #"Append would create a gap"
                             (event-store/try-append! s 1 (event 1)))))
-    (testing "negative numbers are rejected"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                            #"Event numbers are zero-based"
-                            (event-store/try-append! s -1 (event 0)))))
     (is (true? (event-store/try-append! s 0 (event 0))))
     (testing "losing the race is a false, not an exception"
       (is (false? (event-store/try-append! s 0 (event 0)))))
@@ -74,16 +84,46 @@
     (is (= [(event 1)] (into [] (event-store/events s 1))))
     (is (= [] (into [] (event-store/events s 2))))))
 
-(deftest objects-use-inverted-gzip-edn-keys
+(deftest objects-use-inverted-nippy-keys
   (let [objects (objects)
-        s (store objects)]
+        ^S3Client delegate (memory-client/client objects)
+        requests (atom [])
+        client (reify S3Client
+                 (^PutObjectResponse putObject [_ ^PutObjectRequest request ^RequestBody body]
+                   (swap! requests conj [(.contentType request) (.contentEncoding request)])
+                   (.putObject delegate request body))
+                 (^HeadObjectResponse headObject [_ ^HeadObjectRequest request]
+                   (.headObject delegate request)))
+        s (store objects {:client client})]
     (append-range! s 0 2)
     (is (= ["org/acme/events/9223372036854775806"
             "org/acme/events/9223372036854775807"]
            (keys @objects))
         "the newest event sorts first, so the head is one maxKeys=1 LIST")
-    (is (= (pr-str (event 0))
-           (gunzip (get @objects "org/acme/events/9223372036854775807"))))))
+    (is (= [["application/octet-stream" nil] ["application/octet-stream" nil]] @requests))
+    (is (= (event 0)
+           (codec/decode (get @objects "org/acme/events/9223372036854775807"))))))
+
+(deftest event-payloads-do-not-depend-on-print-settings
+  (let [objects (objects)
+        s (store objects)
+        bytes (byte-array [-128 -1 0 1 127])
+        value {:nested [1 2 3 {:more #{:a :b}}] :bytes bytes}]
+    (binding [*print-length* 1 *print-level* 1 *print-dup* true]
+      (is (true? (event-store/try-append! s 0 value))))
+    (aset-byte bytes 0 (byte 42))
+    (let [actual (into [] (event-store/events s 0))]
+      (is (= 1 (count actual)))
+      (is (= (:nested value) (:nested (first actual))))
+      (is (= [-128 -1 0 1 127] (vec (:bytes (first actual))))
+          "the persisted bytes are independent of the caller's array"))))
+
+(deftest unsupported-event-values-never-reach-put
+  (let [objects (objects)
+        s (store objects {:on-retry (fn [_] (throw (AssertionError. "Encoding must not retry")))})]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unsupported event value"
+                          (event-store/try-append! s 0 {:nested [(Object.)]})))
+    (is (empty? @objects))))
 
 (defn- failing-put-client
   "Delegates to a memory client, but the first `failures` putObject calls throw
@@ -99,17 +139,30 @@
             (swap! remaining dec)
             (when store-it?
               (.putObject delegate request body))
-            (throw (SdkClientException/create "Connection reset")))
+            (throw (SdkClientException/create "Connection reset" (java.net.SocketException. "Connection reset"))))
           (.putObject delegate request body)))
 
-      (^ResponseInputStream getObject [_ ^GetObjectRequest request]
-        (.getObject delegate request))
+      (^ResponseInputStream getObject [_ ^GetObjectRequest _request]
+        (throw (AssertionError. "Append ownership must not read the event body")))
 
       (^HeadObjectResponse headObject [_ ^HeadObjectRequest request]
         (.headObject delegate request))
 
       (^ListObjectsV2Response listObjectsV2 [_ ^ListObjectsV2Request request]
         (.listObjectsV2 delegate request)))))
+
+(deftest append-retries-reuse-the-frozen-payload
+  (let [objects (objects)
+        payload (byte-array [1 2 3])
+        retries (atom 0)
+        s (store objects {:client (failing-put-client objects 1 false)
+                           :on-retry (fn [_]
+                                       (swap! retries inc)
+                                       (aset-byte payload 0 (byte 99)))})]
+    (is (true? (event-store/try-append! s 0 {:bytes payload})))
+    (is (= 1 @retries))
+    (is (= [1 2 3] (vec (:bytes (first (into [] (event-store/events s 0))))))
+        "retrying the PUT must not encode the caller's mutated array again")))
 
 (deftest transient-failures-are-retried-until-the-store-answers
   (testing "a put that fails twice and then succeeds still appends"
@@ -131,20 +184,100 @@
                        :prefix "org/acme"
                        :on-retry (constantly nil)})]
       ;; The first attempt stores the object and then throws, so the retry
-      ;; finds the key taken. Reading it back shows the write was ours.
+      ;; finds the key taken. Its metadata shows the write was ours.
       (is (true? (event-store/try-append! s 0 (event 0))))))
 
-  (testing "a key taken by somebody else is still a lost race"
+  (testing "a key taken by somebody else is a lost race, even with the same value"
+    (doseq [winning-event [(event 99) (event 0)]]
+      (let [objs (objects)
+            winner (store objs)]
+        (is (true? (event-store/try-append! winner 0 winning-event)))
+        (let [s (tigris/store {:client (failing-put-client objs 1 false)
+                               :bucket "events"
+                               :prefix "org/acme"
+                               :bundle-request (fn [_ keys] (memory-client/tar objs keys))
+                               :on-retry (constantly nil)})]
+          (is (false? (event-store/try-append! s 0 (event 0))))
+          (is (= winning-event (reduce (fn [_ e] (reduced e)) nil (event-store/events s 0)))))))))
+
+(deftest append-ownership-is-resolved-with-metadata
+  (doseq [hidden-retry? [false true]]
+    (testing (if hidden-retry? "the SDK hides its retry" "the store retries")
+      (let [objs (objects)
+            ^S3Client writer (memory-client/client objs)
+            ;; A separate client must see the same metadata, not just the bytes.
+            ^S3Client reader (memory-client/client objs)
+            ids (atom [])
+            heads (atom [])
+            retries (atom [])
+            client (reify S3Client
+                     (^PutObjectResponse putObject [_ ^PutObjectRequest request ^RequestBody body]
+                       (swap! ids conj (get (.metadata request) "event-store-write-id"))
+                       (if (= 1 (count @ids))
+                         (do
+                           (.putObject writer request body)
+                           (if hidden-retry?
+                             ;; The first response the caller sees is a 412.
+                             (.putObject writer request body)
+                             (throw (SdkClientException/create "Connection reset" (java.net.SocketException. "Connection reset")))))
+                         (.putObject writer request body)))
+                     (^HeadObjectResponse headObject [_ ^HeadObjectRequest request]
+                       (swap! heads conj (get (-> request .overrideConfiguration (.orElseThrow) .headers)
+                                              "X-Tigris-Consistent"))
+                       (.headObject reader request))
+                     (^ResponseInputStream getObject [_ ^GetObjectRequest _request]
+                       (throw (AssertionError. "Append ownership must not read the event body"))))
+            s (store objs {:client client
+                           :headers {"X-Tigris-Consistent" "false"}
+                           :on-retry #(swap! retries conj (:op %))})]
+        (is (true? (event-store/try-append! s 0 (event 0))))
+        (let [id (first @ids)]
+          (is (uuid? (java.util.UUID/fromString id)))
+          (is (= (if hidden-retry? 1 2) (count @ids)))
+          (is (every? #(= id %) @ids) "the ID is stable across retries")
+          (is (= [["true"]] @heads) "ownership HEAD always goes through the leader")
+          (is (= (if hidden-retry? [] [:put]) @retries))
+          (is (false? (event-store/try-append! s 0 (event 0))))
+          (is (not= id (last @ids)) "a new invocation gets a new ID"))
+        (is (= (event 0)
+               (reduce (fn [_ e] (reduced e)) nil (event-store/events s 0))))))))
+
+(deftest conditional-write-conflicts-are-retried
+  (doseq [landed? [false true]]
     (let [objs (objects)
-          winner (store objs)]
-      (is (true? (event-store/try-append! winner 0 (event 99))))
-      (let [s (tigris/store {:client (failing-put-client objs 1 false)
-                             :bucket "events"
-                             :prefix "org/acme"
-                             :bundle-request (fn [_ keys] (memory-client/tar objs keys))
-                             :on-retry (constantly nil)})]
-        (is (false? (event-store/try-append! s 0 (event 0))))
-        (is (= (event 99) (reduce (fn [_ e] (reduced e)) nil (event-store/events s 0))))))))
+          ^S3Client delegate (memory-client/client objs)
+          ids (atom [])
+          retries (atom [])
+          client (reify S3Client
+                   (^PutObjectResponse putObject [_ ^PutObjectRequest request ^RequestBody body]
+                     (swap! ids conj (get (.metadata request) "event-store-write-id"))
+                     (if (= 1 (count @ids))
+                       (do
+                         (when landed? (.putObject delegate request body))
+                         (throw (-> (S3Exception/builder)
+                                    (.statusCode 409)
+                                    (.message "ConditionalRequestConflict")
+                                    (.build))))
+                       (.putObject delegate request body)))
+                   (^HeadObjectResponse headObject [_ ^HeadObjectRequest request]
+                     (.headObject delegate request)))
+          s (store objs {:client client :on-retry #(swap! retries conj (:op %))})]
+      (is (true? (event-store/try-append! s 0 (event 0))))
+      (is (= 2 (count @ids)))
+      (is (apply = @ids))
+      (is (= [:put] @retries))
+      (is (= (event 0) (codec/decode (first (vals @objs))))))))
+
+(deftest legacy-objects-without-write-metadata-are-not-ours
+  (doseq [failures [0 1]]
+    (let [key "org/acme/events/9223372036854775807"
+          ;; Deliberately not Nippy: ownership must not inspect the body.
+          bytes (byte-array [1 2 3])
+          objs (atom (sorted-map key bytes))
+          s (store objs {:client (failing-put-client objs failures false)
+                         :on-retry (constantly nil)})]
+      (is (false? (event-store/try-append! s 0 (event 0))))
+      (is (identical? bytes (get @objs key))))))
 
 (deftest a-terminal-failure-is-thrown-at-once
   (let [attempts (atom 0)
@@ -304,6 +437,50 @@
       (is (= [99 100] [(:got (ex-data t)) (:expected (ex-data t))])
           "and says how much of the batch arrived against what was asked"))))
 
+(deftest a-missing-promised-singleton-is-not-mistaken-for-the-end
+  (doseq [[from total expected-requests]
+          [[0 2 [[1 true] [1 true]]]
+           [1 3 [[1 true] [1 true]]]
+           [0 102 [[1 true] [100 false] [1 true]]]]]
+    (testing (str "replaying " total " events from " from)
+      (let [objects (objects)
+            missing-key (str "org/acme/events/" (- Long/MAX_VALUE (dec total)))
+            requests (atom [])
+            delivered (atom [])
+            s (store objects
+                     {:bundle-request
+                      (fn [store keys]
+                        (swap! requests conj [(count keys)
+                                              (= "true" (get (:headers store) "X-Tigris-Consistent"))])
+                        ;; Delete only when the bounded singleton is fetched,
+                        ;; after the head LIST has already promised it exists.
+                        (when (= [missing-key] keys)
+                          (swap! objects dissoc missing-key))
+                        (memory-client/tar objects keys))})]
+        (append-range! s 0 total)
+        (let [t (try
+                  (reduce (fn [_ e] (swap! delivered conj e))
+                          nil (event-store/events s from))
+                  (catch clojure.lang.ExceptionInfo t t))]
+          (is (instance? clojure.lang.ExceptionInfo t))
+          (is (= {:error :missing-event :expected 1 :got 0 :from missing-key}
+                 (ex-data t)))
+          (is (= (mapv event (range from (dec total))) @delivered))
+          (is (= expected-requests @requests)
+              "the singleton was already read consistently; no retry is needed"))))))
+
+(deftest a-bounded-singleton-can-stop-reduction
+  (let [objects (objects)
+        requests (atom [])
+        s (store objects {:bundle-request (fn [_ keys]
+                                            (swap! requests conj (count keys))
+                                            (memory-client/tar objects keys))})]
+    (append-range! s 0 2)
+    (is (= [(event 0) (event 1)]
+           (into [] (take 2) (event-store/events s 0))))
+    (is (= [1 1] @requests)
+        "reduced on the bounded singleton avoids the final end probe")))
+
 (deftest headers-the-jdk-owns-are-not-copied-onto-the-request
   ;; The signer returns Host because it is signed, and the JDK's HttpClient
   ;; throws IllegalArgumentException rather than let a caller set it. The JDK
@@ -345,10 +522,9 @@
          discover relaxed and 9ms through the leader.")))
 
 (deftest a-short-batch-is-read-again-through-the-leader
-  ;; A short batch is normally the end of the stream, and that is how a replay
-  ;; finds it. But it can also be a replica that has not caught up, and
-  ;; stopping there would silently truncate the replay. The re-read tells the
-  ;; two apart: if the leader has more, keep going.
+  ;; A bounded batch cannot legitimately end early. Replica lag can make it
+  ;; short, so ask the leader for the missing suffix without redelivering the
+  ;; events already passed to the reducing function.
   (let [objects (objects)
         seen (atom [])
         stale? (atom true)
@@ -410,6 +586,10 @@
       (is (= (event 1) (reduce (fn [_ e] (reduced e)) nil (event-store/events s 1)))))))
 
 (defn -main [& _]
-  (let [{:keys [fail error]} (run-tests 'simplemono.event-store.tigris-test)]
+  (let [{:keys [fail error]} (run-tests 'simplemono.event-store.tigris-test
+                                      'simplemono.event-store.tigris.codec-test
+                                      'simplemono.event-store.tigris.retry-test
+                                      'simplemono.event-store.tigris.replay-failure-test
+                                      'simplemono.event-store.tigris.cancellation-test)]
     (when (pos? (+ fail error))
       (System/exit 1))))

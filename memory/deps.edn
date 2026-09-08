@@ -3,4 +3,5 @@
         simplemono/event-store-core {:local/root "../core"}}
  :aliases
  {:test {:extra-paths ["test"]
+         :extra-deps {simplemono/event-store-contract-tests {:local/root "../core/test"}}
          :main-opts ["-m" "simplemono.event-store.memory-test"]}}}

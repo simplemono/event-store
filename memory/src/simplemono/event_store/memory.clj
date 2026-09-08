@@ -23,40 +23,32 @@
                    :event-number event-number
                    :expected expected})))
 
-(defn- check-event-number!
-  [event-number]
-  (when (neg? (long event-number))
-    (throw (ex-info "Event numbers are zero-based"
-                    {:error :incorrect
-                     :event-number event-number}))))
-
 (defrecord MemoryEventStore [state]
   event-store/EventAppend
   (try-append! [_ event-number event]
-    (check-event-number! event-number)
-    (let [event-number (long event-number)]
-      (locking state
-        (let [events @state
-              expected (if-some [latest (last (keys events))]
-                         (inc (long latest))
-                         0)]
-          (cond
-            (contains? events event-number)
-            false
+    (util/check-event-number! event-number)
+    (locking state
+      (let [events @state
+            latest (last (keys events))
+            expected (when-not (= latest Long/MAX_VALUE)
+                       (if (some? latest) (inc (long latest)) 0))]
+        (cond
+          (contains? events event-number)
+          false
 
-            (not= event-number expected)
-            (gap! event-number expected)
+          (not= event-number expected)
+          (gap! event-number expected)
 
-            :else
-            (do
-              (swap! state assoc event-number event)
-              true))))))
+          :else
+          (do
+            (swap! state assoc event-number event)
+            true)))))
 
   event-store/EventSource
   (events [_ from]
     ;; Reading one event from a map costs what reading a hundred does, so the
     ;; generic walk is also the fastest one available here.
-    (util/one-at-a-time #(get @state (long %)) from))
+    (util/one-at-a-time #(find @state %) from))
 
   event-store/EventHead
   (latest-event-number [_]

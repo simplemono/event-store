@@ -4,7 +4,7 @@
 
    One store is one stream, under one prefix in one bucket:
 
-     {prefix}/events/{inverted-19d}   one gzip-EDN object per event
+     {prefix}/events/{inverted-19d}   one Nippy object per event
 
    Event numbers are zero-based and gap-free. `try-append!` is create-only: it
    returns true when the event was written and false when another writer
@@ -35,19 +35,26 @@
    it missed are asked of the leader, and if they are still not there the
    replay throws rather than ending quietly, because the head promised them.
 
-   Transient failures never reach the caller. Every request is retried, with
-   backoff, until Tigris answers: a client-side exception, a 429 or a 5xx means
-   try again, while a 4xx means the request itself is wrong and is thrown at
-   once, so a bad key or a missing bucket fails loudly instead of hanging
-   forever. Retries are announced through :on-retry, and the loop sleeps, so
-   interrupting the thread ends it.
+   Transient request failures are retried indefinitely with backoff: transport
+   I/O, SDK timeouts, 429 and 5xx. A conditional PUT's 409 is also retried, and
+   its 412 is resolved by checking ownership. Other service errors and failures
+   without transient evidence (such as missing credentials) are thrown at once.
+   Retries are announced through :on-retry. Thread interruption or a transport
+   cancellation stops the retry loop without wrapping the reported exception.
+   A cancelled append may already have landed: only a normal true/false return
+   guarantees a resolved outcome.
+
+   Only acquiring a bundle stream is retried. Once it is open, failures reading,
+   decoding or reducing propagate after closing the stream, even if no events
+   have reached the reducer yet. The caller resumes from its committed cursor.
 
    Retrying an append is safe because the put is create-only. What a retry
    cannot see by itself is whether the attempt that failed had in fact landed:
    a later attempt then finds the key taken and cannot tell our own write from
-   somebody else's. Reading the object back settles it — an equal value was
-   ours. That is why events must be EDN round-trippable, and why the caller
-   never has to reason about an ambiguous append.
+   somebody else's. Each append invocation writes a fresh UUID in object
+   metadata and keeps it across retries. A consistent HEAD on every 412 checks
+   that UUID, even when the SDK hid an earlier attempt by retrying internally.
+   Ownership never depends on reading or comparing the event body.
 
    Object names use an inverted key-space (Long/MAX_VALUE - n, zero-padded to
    19 digits), so the newest object sorts first and the head is one LIST with
@@ -60,22 +67,24 @@
             [clojure.string :as str]
             [simplemono.event-store :as event-store]
             [simplemono.event-store.util :as util]
-            [simplemono.event-store.tigris.bundle :as bundle])
-  (:import (java.io ByteArrayInputStream ByteArrayOutputStream)
-           (java.net URI)
-           (java.net.http HttpClient)
-           (java.nio.charset StandardCharsets)
+            [simplemono.event-store.tigris.bundle :as bundle]
+            [simplemono.event-store.tigris.codec :as codec])
+  (:import (java.io InterruptedIOException)
+           (java.net SocketTimeoutException URI)
+           (java.net.http HttpClient HttpTimeoutException)
+           (java.nio.channels ClosedByInterruptException)
+           (java.util.concurrent CancellationException)
            (java.util.function Consumer)
-           (java.util.zip GZIPInputStream GZIPOutputStream)
            (software.amazon.awssdk.auth.credentials AwsBasicCredentials
                                                     DefaultCredentialsProvider
                                                     StaticCredentialsProvider)
-           (software.amazon.awssdk.core.exception SdkClientException)
+           (software.amazon.awssdk.core.exception AbortedException
+                                                 ApiCallAttemptTimeoutException
+                                                 ApiCallTimeoutException)
            (software.amazon.awssdk.core.sync RequestBody)
            (software.amazon.awssdk.regions Region)
            (software.amazon.awssdk.services.s3 S3Client)
-           (software.amazon.awssdk.services.s3.model GetObjectRequest
-                                                     HeadObjectRequest
+           (software.amazon.awssdk.services.s3.model HeadObjectRequest
                                                      ListObjectsV2Request
                                                      ListObjectsV2Response
                                                      NoSuchKeyException
@@ -135,37 +144,66 @@
       (when (re-matches (re-pattern (str "\\d{" number-width "}")) segment)
         (parse-number segment)))))
 
-(defn- gzip-bytes
-  [s]
-  (let [out (ByteArrayOutputStream.)]
-    (with-open [gzip (GZIPOutputStream. out)]
-      (.write gzip (.getBytes (str s) StandardCharsets/UTF_8)))
-    (.toByteArray out)))
-
-(defn- conflict?
-  [^S3Exception e]
-  (contains? #{409 412} (.statusCode e)))
-
 (defn- not-found?
   [^S3Exception e]
   (= 404 (.statusCode e)))
 
-(defn- transient-failure?
-  "True when the object store may answer differently next time. A client-side
-   exception is a network or timeout problem, 429 is throttling and 5xx is the
-   store's own trouble. Everything else — a bad key, a missing bucket, a
-   malformed request — is the caller's problem and must not be retried, or a
-   configuration error turns into a silent hang."
+(defn- exception-chain
   [t]
-  (or (instance? SdkClientException t)
-      ;; The bundle goes out over the JDK's HTTP client rather than the SDK, so
-      ;; its network failures arrive as IOException and its 5xx as an ex-info.
-      (instance? java.io.IOException t)
-      (= :unavailable (:error (ex-data t)))
-      (and (instance? S3Exception t)
-           (let [status (.statusCode ^S3Exception t)]
-             (or (= 429 status)
-                 (<= 500 status))))))
+  (take-while some? (iterate #(.getCause ^Throwable %) t)))
+
+(defn- request-timeout?
+  [t]
+  (or (instance? ApiCallTimeoutException t)
+      (instance? ApiCallAttemptTimeoutException t)
+      (instance? SocketTimeoutException t)
+      (instance? HttpTimeoutException t)))
+
+(defn- cancellation?
+  [t]
+  (or (.isInterrupted (Thread/currentThread))
+      (some #(or (instance? InterruptedException %)
+                 (instance? CancellationException %)
+                 (instance? AbortedException %)
+                 (instance? ClosedByInterruptException %)
+                 ;; Subclasses can represent timeouts, e.g. Apache's connect
+                 ;; timeout, rather than thread interruption.
+                 (= InterruptedIOException (class %)))
+            ;; SDK request deadlines can use interruption internally. A timeout
+            ;; wrapper is authoritative unless the caller's thread is interrupted.
+            (take-while #(not (request-timeout? %)) (exception-chain t)))))
+
+(defn- check-interrupted!
+  []
+  (when (.isInterrupted (Thread/currentThread))
+    (throw (InterruptedException. "Event-store request interrupted"))))
+
+(defn- transient-failure?
+  "Retry transport I/O, SDK timeouts, throttling and server errors. A generic
+   SdkClientException is not sufficient evidence: missing credentials and bad
+   configuration use that class too. Conditional PUT's 409 is retryable, but
+   its 412 is handled separately by checking write ownership."
+  [op t]
+  (cond
+    (cancellation? t) false
+
+    (instance? S3Exception t)
+    (let [status (.statusCode ^S3Exception t)]
+      (or (= 429 status) (<= 500 status 599) (and (= op :put) (= 409 status))))
+
+    (= :unavailable (:error (ex-data t))) true
+
+    :else
+    (let [causes (exception-chain t)]
+      (and
+       ;; These I/O failures need configuration changes, not more requests.
+       (not-any? #(or (instance? java.io.FileNotFoundException %)
+                      (instance? java.nio.file.FileSystemException %)
+                      (instance? javax.net.ssl.SSLHandshakeException %)
+                      (instance? javax.net.ssl.SSLPeerUnverifiedException %))
+                 causes)
+       (some #(or (instance? java.io.IOException %) (request-timeout? %))
+             causes)))))
 
 (defn- retry-delay-ms
   "Exponential backoff from 100ms, capped at 30s, with jitter so that writers
@@ -178,6 +216,7 @@
   "Announce the failed attempt, then sleep before the next one. Sleeping is
    what makes the loop interruptible: interrupting the thread ends it."
   [{:keys [on-retry]} op key attempt ^Throwable t]
+  (check-interrupted!)
   (on-retry {:op op
              :key key
              :attempt attempt
@@ -188,10 +227,11 @@
   "Call `thunk` until the object store answers, retrying transient failures."
   [store op key thunk]
   (loop [attempt 1]
+    (check-interrupted!)
     (let [outcome (try
                     {:value (thunk)}
                     (catch Throwable t
-                      (if (transient-failure? t)
+                      (if (transient-failure? op t)
                         {:failure t}
                         (throw t))))]
       (if-some [t (:failure outcome)]
@@ -209,92 +249,61 @@
       (when create-only?
         (.putHeader builder "If-None-Match" "*")))))
 
-(defn- get-edn
-  "The gzip-EDN value at `key`, or nil when the object does not exist."
+(defn- consistent
+  "The same store, routed through the leader."
+  [store]
+  (update store :headers merge consistent-header))
+
+(defn- object-metadata
+  "The metadata at `key`, or nil when the object does not exist."
   [{:keys [^S3Client client bucket headers] :as store} key]
   (try
     (with-retry
-      store :get key
+      store :head key
       (fn []
-        (with-open [in (.getObject client
-                                   (-> (GetObjectRequest/builder)
-                                       (.bucket bucket)
-                                       (.key key)
-                                       (.overrideConfiguration (override headers false))
-                                       (.build)))
-                    gzip (GZIPInputStream. in)]
-          (edn/read-string (slurp gzip :encoding "UTF-8")))))
-    (catch NoSuchKeyException _
-      nil)
+        (.metadata (.headObject client
+                                (-> (HeadObjectRequest/builder)
+                                    (.bucket bucket)
+                                    (.key key)
+                                    (.overrideConfiguration (override headers false))
+                                    (.build))))))
     (catch S3Exception e
-      (if (not-found? e)
+      (if (and (not (cancellation? e))
+               (or (instance? NoSuchKeyException e) (not-found? e)))
         nil
         (throw e)))))
 
 (defn- put-once!
   "One create-only put. True when created, false when the key already existed."
-  [{:keys [^S3Client client bucket headers]} key bytes]
+  [{:keys [^S3Client client bucket headers]} key bytes write-id]
   (try
     (.putObject client
                 (-> (PutObjectRequest/builder)
                     (.bucket bucket)
                     (.key key)
                     (.overrideConfiguration (override headers true))
-                    (.contentType "application/edn; charset=utf-8")
-                    (.contentEncoding "gzip")
+                    (.contentType "application/octet-stream")
+                    (.metadata {"event-store-write-id" write-id})
                     (.build))
                 (RequestBody/fromBytes bytes))
     true
     (catch S3Exception e
-      (if (conflict? e)
+      (if (and (not (cancellation? e)) (= 412 (.statusCode e)))
         false
         (throw e)))))
 
 (defn- put!
-  "Create-only put of `bytes` at `key`, retrying until the object store
-   answers. True when this store created the object, false when it already
-   existed.
-
-   An attempt that failed transiently may still have landed. When a later
-   attempt then finds the key taken, `value` decides whose write it was: an
-   equal stored value was ours."
-  [store key bytes value]
-  (loop [attempt 1
-         uncertain? false]
-    (let [outcome (try
-                    {:created? (put-once! store key bytes)}
-                    (catch Throwable t
-                      (if (transient-failure? t)
-                        {:failure t}
-                        (throw t))))]
-      (if-some [t (:failure outcome)]
-        (do
-          (await-retry! store :put key attempt t)
-          (recur (inc attempt) true))
-        (let [created? (:created? outcome)]
-          (if (and (false? created?) uncertain?)
-            (= value (get-edn store key))
-            created?))))))
-
-(defn- object-exists?
-  [{:keys [^S3Client client bucket headers] :as store} key]
-  (try
-    (with-retry
-      store :head key
-      (fn []
-        (.headObject client
-                     (-> (HeadObjectRequest/builder)
-                         (.bucket bucket)
-                         (.key key)
-                         (.overrideConfiguration (override headers false))
-                         (.build)))
-        true))
-    (catch NoSuchKeyException _
-      false)
-    (catch S3Exception e
-      (if (not-found? e)
-        false
-        (throw e)))))
+  "Create-only put of `bytes` at `key`. A fresh UUID identifies this invocation
+   and stays in the object's metadata across retries. Every 412 is resolved
+   with a consistent HEAD: the SDK may have retried without telling us, and
+   equal event values do not establish ownership. A 409 only means a write
+   conflicted, not that the key exists, so it is retried."
+  [store key bytes]
+  (let [write-id (str (random-uuid))
+        created? (with-retry store :put key #(put-once! store key bytes write-id))]
+    (or created?
+        (= write-id (get (object-metadata (consistent store) key)
+                         "event-store-write-id")))))
 
 (defn- newest-number
   "The highest number under `prefix`, or nil when the prefix is empty. One LIST
@@ -334,18 +343,13 @@
    a Class A operation on object stores such as Tigris while HEAD is Class B,
    roughly ten times cheaper."
   [{:keys [prefix] :as store} event-number event]
-  (let [event-number (long event-number)]
-    (when (neg? event-number)
-      (throw (ex-info "Event numbers are zero-based"
-                      {:error :incorrect
-                       :event-number event-number})))
-    (if (or (zero? event-number)
-            (object-exists? store (event-key prefix (dec event-number))))
-      (put! store
-            (event-key prefix event-number)
-            (gzip-bytes (pr-str event))
-            event)
-      (gap! event-number))))
+  (util/check-event-number! event-number)
+  (if (or (zero? event-number)
+          (some? (object-metadata store (event-key prefix (dec event-number)))))
+    (put! store
+          (event-key prefix event-number)
+          (codec/encode event))
+    (gap! event-number)))
 
 (defn- print-retry
   [{:keys [op key attempt ^Throwable exception]}]
@@ -355,14 +359,9 @@
                   (.getMessage exception)))))
 
 (defn- bundle-keys
-  "The keys for events [from, to], inclusive."
-  [prefix from to]
-  (mapv #(event-key prefix %) (range (long from) (inc (long to)))))
-
-(defn- decode
-  [^bytes gzipped]
-  (with-open [gzip (GZIPInputStream. (ByteArrayInputStream. gzipped))]
-    (edn/read-string (slurp gzip :encoding "UTF-8"))))
+  "The keys for a batch of `size` events starting at `from`."
+  [prefix from size]
+  (mapv #(event-key prefix (+ (long from) %)) (range size)))
 
 (defn- reduce-bundle
   "Reduce `f` over the events at `keys`, in the order asked for. Returns
@@ -375,7 +374,9 @@
 
    Entry names are checked against the keys, because a gap-free stream cannot
    legitimately skip one and a replay that quietly dropped an event would be
-   far worse than one that stopped."
+   far worse than one that stopped. Stream, decode and reducer exceptions are
+   propagated without retry, with the stream closed and prior reducer effects
+   left intact."
   [store keys f init]
   ;; Only getting hold of the archive is retried. Once entries start reaching
   ;; `f` a retry would hand it the same events twice, so a failure mid-stream
@@ -393,7 +394,7 @@
                              {:error :missing-event
                               :expected expected
                               :got name})))
-           (let [acc (f acc (decode content))
+           (let [acc (f acc (codec/decode content))
                  state {:acc acc :read (inc (long read)) :stopped? (reduced? acc)}]
              (if (reduced? acc)
                (reduced state)
@@ -412,51 +413,37 @@
   [store]
   (update store :headers dissoc (key (first consistent-header))))
 
-(defn- consistent
-  "The same store, routed through the leader."
-  [store]
-  (update store :headers merge consistent-header))
-
 (defn- fetch-batch
-  "One batch, read the cheap way, and ask the leader about the rest when the
-   cheap read came up short for a reason `f` did not cause.
+  "Read a batch whose keys the head has promised exist. A short relaxed read
+   is checked with the leader; a short consistent read throws unless `f`
+   stopped early. This also applies to a batch containing just one key.
 
-   A short batch has two innocent explanations and one bad one. `f` may have
-   stopped. The stream may end inside the batch, which is how a replay finds
-   the end at all. Or a replica has not caught up, and stopping there would
-   silently truncate the replay. The second read tells the last two apart: if
-   the leader has nothing more either, the stream really does end there.
+   Only the missing suffix is read again, carrying on from the accumulator
+   already produced. Re-reading the whole batch would hand `f` the same events
+   twice, and discarding the accumulator would not undo side effects or the
+   transients used by `into` and `transduce`.
 
-   It asks only for the keys the first read did not return, and carries on from
-   the accumulator it produced. Re-reading the whole batch would hand `f` the
-   same events twice, which is fine for `conj` on a vector and wrong for
-   anything with state — and `into` and `transduce` use transients, so
-   discarding the accumulator would not undo it."
+   End probes are separate: `replay` calls `reduce-bundle` directly for a key
+   not yet promised by the head, where an empty answer is legitimate."
   [store keys f init]
-  (let [;; The first batch of a replay is one key, and the leader premium is a
-        ;; few milliseconds on a response that size. Reading it through the
-        ;; leader makes the answer final, so an idle replay — the call that
-        ;; runs most often — is one request rather than one and a re-read.
-        first-read (if (= 1 (count keys)) (consistent store) (relaxed store))
-        {:keys [acc read stopped?] :as cheap} (reduce-bundle first-read keys f init)]
-    (if (or stopped?
-            (= read (count keys))
-            (= 1 (count keys)))
-      cheap
-      (let [rest-keys (vec (drop read keys))
-            {:keys [acc read stopped?]} (reduce-bundle (consistent store) rest-keys f acc)
-            total (+ (long (:read cheap)) (long read))]
-        (when-not (or stopped? (= total (count keys)))
-          ;; Every key here was promised by a consistent LIST of the head, and
-          ;; the leader has now been asked directly. There is no innocent
-          ;; reading left: the events are gone. Returning the short count would
-          ;; end the replay quietly and lose everything after the hole.
-          (throw (ex-info "The stream is missing events the head promised"
-                          {:error :missing-event
-                           :expected (count keys)
-                           :got total
-                           :from (first keys)})))
-        {:acc acc :read total :stopped? stopped?}))))
+  (let [single? (= 1 (count keys))
+        first-read (if single? (consistent store) (relaxed store))
+        {:keys [acc read stopped?] :as cheap} (reduce-bundle first-read keys f init)
+        result (if (or stopped? (= read (count keys)) single?)
+                 ;; A singleton has already been asked of the leader.
+                 cheap
+                 (let [rest-keys (vec (drop read keys))
+                       {:keys [acc read stopped?]} (reduce-bundle (consistent store) rest-keys f acc)]
+                   {:acc acc
+                    :read (+ (long (:read cheap)) (long read))
+                    :stopped? stopped?}))]
+    (when-not (or (:stopped? result) (= (:read result) (count keys)))
+      (throw (ex-info "The stream is missing events the head promised"
+                      {:error :missing-event
+                       :expected (count keys)
+                       :got (:read result)
+                       :from (first keys)})))
+    result))
 
 (def ^:private max-batch-size
   "The most events one request asks for.
@@ -504,20 +491,22 @@
       (or (nil? latest)
           (> event-number (long latest)))
       (let [{:keys [acc read stopped?]}
-            (fetch-batch store [(event-key prefix event-number)] f acc)]
+            (reduce-bundle (consistent store) [(event-key prefix event-number)] f acc)]
         (cond
           stopped? @acc
-          (zero? (long read)) acc
+          (or (zero? (long read)) (= event-number Long/MAX_VALUE)) acc
           :else (recur (inc event-number) acc (head store))))
 
       :else
-      (let [size (min max-batch-size (- (inc (long latest)) event-number))
-            keys (bundle-keys prefix event-number (dec (+ event-number size)))
-            {:keys [acc read stopped?]} (fetch-batch store keys f acc)]
+      ;; Subtract before incrementing, so a head at Long/MAX_VALUE is safe.
+      (let [size (inc (min (dec max-batch-size) (- (long latest) event-number)))
+            last-number (+ event-number (dec size))
+            keys (bundle-keys prefix event-number size)
+            {:keys [acc stopped?]} (fetch-batch store keys f acc)]
         (cond
           stopped? @acc
-          (< (long read) size) acc
-          :else (recur (+ event-number (long read)) acc latest))))))
+          (= last-number Long/MAX_VALUE) acc
+          :else (recur (inc last-number) acc latest))))))
 
 (defrecord TigrisEventStore [client bucket prefix headers endpoint region
                              credentials-provider http-client bundle-request
@@ -528,6 +517,7 @@
 
   event-store/EventSource
   (events [this from]
+    (util/check-event-number! from)
     (util/reducible
      (fn [rf init]
        (replay this from rf init))))
