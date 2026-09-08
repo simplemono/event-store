@@ -42,6 +42,10 @@
    Retries are announced through :on-retry, and the loop sleeps, so interrupting
    the thread ends it.
 
+   Only acquiring a bundle stream is retried. Once it is open, failures reading,
+   decoding or reducing propagate after closing the stream, even if no events
+   have reached the reducer yet. The caller resumes from its committed cursor.
+
    Retrying an append is safe because the put is create-only. What a retry
    cannot see by itself is whether the attempt that failed had in fact landed:
    a later attempt then finds the key taken and cannot tell our own write from
@@ -337,7 +341,9 @@
 
    Entry names are checked against the keys, because a gap-free stream cannot
    legitimately skip one and a replay that quietly dropped an event would be
-   far worse than one that stopped."
+   far worse than one that stopped. Stream, decode and reducer exceptions are
+   propagated without retry, with the stream closed and prior reducer effects
+   left intact."
   [store keys f init]
   ;; Only getting hold of the archive is retried. Once entries start reaching
   ;; `f` a retry would hand it the same events twice, so a failure mid-stream

@@ -70,6 +70,12 @@
      lazy sequence handed to a caller could not promise. Anyone who wants the
      whole stream in memory can still write `(into [] …)` and say so.
 
+     Failures while consuming an open stream, decoding events, or running `f`
+     propagate. A failed walk may already have delivered a prefix to `f`; those
+     effects are not rolled back or replayed automatically. The caller resumes from its last durably committed cursor,
+     which need not be the last event delivered. Commit projection updates and
+     their cursor together; external effects need their own idempotency.
+
      How the events are fetched is the store's business, because only the store
      knows what a request costs."))
 

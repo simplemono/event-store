@@ -145,6 +145,20 @@ current payload format described below.
 The ID is internal, not a caller-supplied idempotency key for application retries
 or restarts.
 
+### Partial replay
+
+Only acquiring the bundle stream is retried. Once the stream is open, failures
+reading it, decoding events, or running the reducer propagate after the stream is
+closed. This applies even if the failure occurs before the first event is
+delivered. Reducer exceptions are never retried, including ones that happen to
+look like transient network errors.
+
+A failed reduction may already have processed a prefix. Those effects are not
+rolled back, and the library does not resume automatically. Resume explicitly
+from the last **durably committed projection cursor**, not merely the last event
+delivered to the reducer. Commit the projection changes and their cursor together;
+external side effects require their own idempotency.
+
 ## Replaying
 
 **A replay does not read one object per event.** Tigris can return many objects
