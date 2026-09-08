@@ -37,17 +37,19 @@
 
    Transient failures never reach the caller. Every request is retried, with
    backoff, until Tigris answers: a client-side exception, a 429 or a 5xx means
-   try again, while a 4xx means the request itself is wrong and is thrown at
-   once, so a bad key or a missing bucket fails loudly instead of hanging
-   forever. Retries are announced through :on-retry, and the loop sleeps, so
-   interrupting the thread ends it.
+   try again. A conditional PUT's 409 is also retried, and its 412 is resolved
+   by checking ownership. Other 4xx responses are thrown at once, so a bad key
+   or a missing bucket fails loudly instead of hanging forever. Retries are
+   announced through :on-retry, and the loop sleeps, so interrupting the thread
+   ends it.
 
    Retrying an append is safe because the put is create-only. What a retry
    cannot see by itself is whether the attempt that failed had in fact landed:
    a later attempt then finds the key taken and cannot tell our own write from
-   somebody else's. Reading the object back settles it — an equal value was
-   ours. That is why events must be EDN round-trippable, and why the caller
-   never has to reason about an ambiguous append.
+   somebody else's. Each append invocation writes a fresh UUID in object
+   metadata and keeps it across retries. A consistent HEAD on every 412 checks
+   that UUID, even when the SDK hid an earlier attempt by retrying internally.
+   Ownership never depends on reading or comparing the event body.
 
    Object names use an inverted key-space (Long/MAX_VALUE - n, zero-padded to
    19 digits), so the newest object sorts first and the head is one LIST with
@@ -74,8 +76,7 @@
            (software.amazon.awssdk.core.sync RequestBody)
            (software.amazon.awssdk.regions Region)
            (software.amazon.awssdk.services.s3 S3Client)
-           (software.amazon.awssdk.services.s3.model GetObjectRequest
-                                                     HeadObjectRequest
+           (software.amazon.awssdk.services.s3.model HeadObjectRequest
                                                      ListObjectsV2Request
                                                      ListObjectsV2Response
                                                      NoSuchKeyException
@@ -142,10 +143,6 @@
       (.write gzip (.getBytes (str s) StandardCharsets/UTF_8)))
     (.toByteArray out)))
 
-(defn- conflict?
-  [^S3Exception e]
-  (contains? #{409 412} (.statusCode e)))
-
 (defn- not-found?
   [^S3Exception e]
   (= 404 (.statusCode e)))
@@ -209,21 +206,24 @@
       (when create-only?
         (.putHeader builder "If-None-Match" "*")))))
 
-(defn- get-edn
-  "The gzip-EDN value at `key`, or nil when the object does not exist."
+(defn- consistent
+  "The same store, routed through the leader."
+  [store]
+  (update store :headers merge consistent-header))
+
+(defn- object-metadata
+  "The metadata at `key`, or nil when the object does not exist."
   [{:keys [^S3Client client bucket headers] :as store} key]
   (try
     (with-retry
-      store :get key
+      store :head key
       (fn []
-        (with-open [in (.getObject client
-                                   (-> (GetObjectRequest/builder)
-                                       (.bucket bucket)
-                                       (.key key)
-                                       (.overrideConfiguration (override headers false))
-                                       (.build)))
-                    gzip (GZIPInputStream. in)]
-          (edn/read-string (slurp gzip :encoding "UTF-8")))))
+        (.metadata (.headObject client
+                                (-> (HeadObjectRequest/builder)
+                                    (.bucket bucket)
+                                    (.key key)
+                                    (.overrideConfiguration (override headers false))
+                                    (.build))))))
     (catch NoSuchKeyException _
       nil)
     (catch S3Exception e
@@ -233,7 +233,7 @@
 
 (defn- put-once!
   "One create-only put. True when created, false when the key already existed."
-  [{:keys [^S3Client client bucket headers]} key bytes]
+  [{:keys [^S3Client client bucket headers]} key bytes write-id]
   (try
     (.putObject client
                 (-> (PutObjectRequest/builder)
@@ -242,59 +242,39 @@
                     (.overrideConfiguration (override headers true))
                     (.contentType "application/edn; charset=utf-8")
                     (.contentEncoding "gzip")
+                    (.metadata {"event-store-write-id" write-id})
                     (.build))
                 (RequestBody/fromBytes bytes))
     true
     (catch S3Exception e
-      (if (conflict? e)
+      (if (= 412 (.statusCode e))
         false
         (throw e)))))
 
 (defn- put!
-  "Create-only put of `bytes` at `key`, retrying until the object store
-   answers. True when this store created the object, false when it already
-   existed.
-
-   An attempt that failed transiently may still have landed. When a later
-   attempt then finds the key taken, `value` decides whose write it was: an
-   equal stored value was ours."
-  [store key bytes value]
-  (loop [attempt 1
-         uncertain? false]
-    (let [outcome (try
-                    {:created? (put-once! store key bytes)}
-                    (catch Throwable t
-                      (if (transient-failure? t)
-                        {:failure t}
-                        (throw t))))]
-      (if-some [t (:failure outcome)]
-        (do
-          (await-retry! store :put key attempt t)
-          (recur (inc attempt) true))
-        (let [created? (:created? outcome)]
-          (if (and (false? created?) uncertain?)
-            (= value (get-edn store key))
-            created?))))))
-
-(defn- object-exists?
-  [{:keys [^S3Client client bucket headers] :as store} key]
-  (try
-    (with-retry
-      store :head key
-      (fn []
-        (.headObject client
-                     (-> (HeadObjectRequest/builder)
-                         (.bucket bucket)
-                         (.key key)
-                         (.overrideConfiguration (override headers false))
-                         (.build)))
-        true))
-    (catch NoSuchKeyException _
-      false)
-    (catch S3Exception e
-      (if (not-found? e)
-        false
-        (throw e)))))
+  "Create-only put of `bytes` at `key`. A fresh UUID identifies this invocation
+   and stays in the object's metadata across retries. Every 412 is resolved
+   with a consistent HEAD: the SDK may have retried without telling us, and
+   equal event values do not establish ownership. A 409 only means a write
+   conflicted, not that the key exists, so it is retried."
+  [store key bytes]
+  (let [write-id (str (random-uuid))]
+    (loop [attempt 1]
+      (let [outcome (try
+                      {:created? (put-once! store key bytes write-id)}
+                      (catch Throwable t
+                        (if (or (transient-failure? t)
+                                (and (instance? S3Exception t)
+                                     (= 409 (.statusCode ^S3Exception t))))
+                          {:failure t}
+                          (throw t))))]
+        (if-some [t (:failure outcome)]
+          (do
+            (await-retry! store :put key attempt t)
+            (recur (inc attempt)))
+          (or (:created? outcome)
+              (= write-id (get (object-metadata (consistent store) key)
+                               "event-store-write-id"))))))))
 
 (defn- newest-number
   "The highest number under `prefix`, or nil when the prefix is empty. One LIST
@@ -340,11 +320,10 @@
                       {:error :incorrect
                        :event-number event-number})))
     (if (or (zero? event-number)
-            (object-exists? store (event-key prefix (dec event-number))))
+            (some? (object-metadata store (event-key prefix (dec event-number)))))
       (put! store
             (event-key prefix event-number)
-            (gzip-bytes (pr-str event))
-            event)
+            (gzip-bytes (pr-str event)))
       (gap! event-number))))
 
 (defn- print-retry
@@ -411,11 +390,6 @@
    every batch."
   [store]
   (update store :headers dissoc (key (first consistent-header))))
-
-(defn- consistent
-  "The same store, routed through the leader."
-  [store]
-  (update store :headers merge consistent-header))
 
 (defn- fetch-batch
   "One batch, read the cheap way, and ask the leader about the rest when the

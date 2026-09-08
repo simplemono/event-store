@@ -102,8 +102,8 @@
             (throw (SdkClientException/create "Connection reset")))
           (.putObject delegate request body)))
 
-      (^ResponseInputStream getObject [_ ^GetObjectRequest request]
-        (.getObject delegate request))
+      (^ResponseInputStream getObject [_ ^GetObjectRequest _request]
+        (throw (AssertionError. "Append ownership must not read the event body")))
 
       (^HeadObjectResponse headObject [_ ^HeadObjectRequest request]
         (.headObject delegate request))
@@ -131,20 +131,100 @@
                        :prefix "org/acme"
                        :on-retry (constantly nil)})]
       ;; The first attempt stores the object and then throws, so the retry
-      ;; finds the key taken. Reading it back shows the write was ours.
+      ;; finds the key taken. Its metadata shows the write was ours.
       (is (true? (event-store/try-append! s 0 (event 0))))))
 
-  (testing "a key taken by somebody else is still a lost race"
+  (testing "a key taken by somebody else is a lost race, even with the same value"
+    (doseq [winning-event [(event 99) (event 0)]]
+      (let [objs (objects)
+            winner (store objs)]
+        (is (true? (event-store/try-append! winner 0 winning-event)))
+        (let [s (tigris/store {:client (failing-put-client objs 1 false)
+                               :bucket "events"
+                               :prefix "org/acme"
+                               :bundle-request (fn [_ keys] (memory-client/tar objs keys))
+                               :on-retry (constantly nil)})]
+          (is (false? (event-store/try-append! s 0 (event 0))))
+          (is (= winning-event (reduce (fn [_ e] (reduced e)) nil (event-store/events s 0)))))))))
+
+(deftest append-ownership-is-resolved-with-metadata
+  (doseq [hidden-retry? [false true]]
+    (testing (if hidden-retry? "the SDK hides its retry" "the store retries")
+      (let [objs (objects)
+            ^S3Client writer (memory-client/client objs)
+            ;; A separate client must see the same metadata, not just the bytes.
+            ^S3Client reader (memory-client/client objs)
+            ids (atom [])
+            heads (atom [])
+            retries (atom [])
+            client (reify S3Client
+                     (^PutObjectResponse putObject [_ ^PutObjectRequest request ^RequestBody body]
+                       (swap! ids conj (get (.metadata request) "event-store-write-id"))
+                       (if (= 1 (count @ids))
+                         (do
+                           (.putObject writer request body)
+                           (if hidden-retry?
+                             ;; The first response the caller sees is a 412.
+                             (.putObject writer request body)
+                             (throw (SdkClientException/create "Connection reset"))))
+                         (.putObject writer request body)))
+                     (^HeadObjectResponse headObject [_ ^HeadObjectRequest request]
+                       (swap! heads conj (get (-> request .overrideConfiguration (.orElseThrow) .headers)
+                                              "X-Tigris-Consistent"))
+                       (.headObject reader request))
+                     (^ResponseInputStream getObject [_ ^GetObjectRequest _request]
+                       (throw (AssertionError. "Append ownership must not read the event body"))))
+            s (store objs {:client client
+                           :headers {"X-Tigris-Consistent" "false"}
+                           :on-retry #(swap! retries conj (:op %))})]
+        (is (true? (event-store/try-append! s 0 (event 0))))
+        (let [id (first @ids)]
+          (is (uuid? (java.util.UUID/fromString id)))
+          (is (= (if hidden-retry? 1 2) (count @ids)))
+          (is (every? #(= id %) @ids) "the ID is stable across retries")
+          (is (= [["true"]] @heads) "ownership HEAD always goes through the leader")
+          (is (= (if hidden-retry? [] [:put]) @retries))
+          (is (false? (event-store/try-append! s 0 (event 0))))
+          (is (not= id (last @ids)) "a new invocation gets a new ID"))
+        (is (= (event 0)
+               (reduce (fn [_ e] (reduced e)) nil (event-store/events s 0))))))))
+
+(deftest conditional-write-conflicts-are-retried
+  (doseq [landed? [false true]]
     (let [objs (objects)
-          winner (store objs)]
-      (is (true? (event-store/try-append! winner 0 (event 99))))
-      (let [s (tigris/store {:client (failing-put-client objs 1 false)
-                             :bucket "events"
-                             :prefix "org/acme"
-                             :bundle-request (fn [_ keys] (memory-client/tar objs keys))
-                             :on-retry (constantly nil)})]
-        (is (false? (event-store/try-append! s 0 (event 0))))
-        (is (= (event 99) (reduce (fn [_ e] (reduced e)) nil (event-store/events s 0))))))))
+          ^S3Client delegate (memory-client/client objs)
+          ids (atom [])
+          retries (atom [])
+          client (reify S3Client
+                   (^PutObjectResponse putObject [_ ^PutObjectRequest request ^RequestBody body]
+                     (swap! ids conj (get (.metadata request) "event-store-write-id"))
+                     (if (= 1 (count @ids))
+                       (do
+                         (when landed? (.putObject delegate request body))
+                         (throw (-> (S3Exception/builder)
+                                    (.statusCode 409)
+                                    (.message "ConditionalRequestConflict")
+                                    (.build))))
+                       (.putObject delegate request body)))
+                   (^HeadObjectResponse headObject [_ ^HeadObjectRequest request]
+                     (.headObject delegate request)))
+          s (store objs {:client client :on-retry #(swap! retries conj (:op %))})]
+      (is (true? (event-store/try-append! s 0 (event 0))))
+      (is (= 2 (count @ids)))
+      (is (apply = @ids))
+      (is (= [:put] @retries))
+      (is (= (pr-str (event 0)) (gunzip (first (vals @objs))))))))
+
+(deftest legacy-objects-without-write-metadata-are-not-ours
+  (doseq [failures [0 1]]
+    (let [key "org/acme/events/9223372036854775807"
+          ;; Deliberately not EDN or gzip: ownership must not inspect the body.
+          bytes (byte-array [1 2 3])
+          objs (atom (sorted-map key bytes))
+          s (store objs {:client (failing-put-client objs failures false)
+                         :on-retry (constantly nil)})]
+      (is (false? (event-store/try-append! s 0 (event 0))))
+      (is (identical? bytes (get @objs key))))))
 
 (deftest a-terminal-failure-is-thrown-at-once
   (let [attempts (atom 0)

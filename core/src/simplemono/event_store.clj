@@ -28,8 +28,9 @@
   (try-append! [store event-number event]
     "Create-only append of `event` at zero-based `event-number`.
 
-     Returns true when the event was written, and false when `event-number`
-     already exists — another writer won the race.
+     Returns true when this invocation wrote the event, including its retries,
+     and false when another invocation owns `event-number`, even if the event
+     values are equal.
 
      Throws `ex-info` with `:error` in its `ex-data` for exceptional states:
 
@@ -43,8 +44,7 @@
      implementation's job, because only it knows what it wrote and where.
 
      An event must be a value the implementation can store and read back
-     unchanged, which is what lets an implementation settle an uncertain write
-     by comparing what is stored with what it meant to store."))
+     unchanged. Write ownership is separate from event equality."))
 
 (defprotocol EventSource
   (events [store from]

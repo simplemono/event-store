@@ -103,29 +103,36 @@ the right response is to catch the read model up and decide again:
 Deciding inside the loop is what makes this safe: a lost append re-runs the
 decision against fresh state instead of replaying a stale one.
 
-An append is one HEAD plus one PUT. The previous event is checked with HEAD
-rather than by listing the stream, because LIST is a Class A operation on
+An uncontended append is one HEAD plus one PUT (just the PUT for event zero).
+A 412 conflict adds a HEAD to identify the write that owns the number. HEAD is
+used rather than listing the stream because LIST is a Class A operation on
 object stores such as Tigris while HEAD is Class B — roughly ten times cheaper.
 
 ## Failure
 
 A transient failure never reaches the caller. Every request is retried, with
 exponential backoff and jitter, until the object store answers: a client-side
-exception, a 429 or a 5xx means try again. A 4xx means the request itself is
-wrong and is thrown at once, so a bad key or a missing bucket fails loudly
-rather than hanging forever. The loop sleeps between attempts, so interrupting
+exception, a 429 or a 5xx means try again. A conditional PUT's 409 is also
+retried; its 412 is resolved by checking ownership as described below. Other
+4xx responses mean the request itself is wrong and are thrown at once, so a
+bad key or a missing bucket fails loudly rather than hanging forever. The loop
+sleeps between attempts, so interrupting
 the thread ends it, and `:on-retry` is called before each attempt — replace it
 with your own logging, or an outage is indistinguishable from slowness.
 
-Retrying an append is safe because the put is create-only. What a retry cannot
-see by itself is whether the attempt that failed had in fact landed: a later
-attempt then finds the key taken and cannot tell our own write from somebody
-else's. Reading the object back settles it — an equal value was ours.
+Retrying an append is safe because the put is create-only. Each `try-append!`
+invocation generates a fresh UUID, stored as `event-store-write-id` in object
+metadata and kept unchanged across retries. On every 412, a strongly consistent
+HEAD compares that ID: the same ID means our write landed; a different or absent
+ID means another invocation owns the number. No event body is fetched or parsed.
+This also handles retries hidden inside the AWS SDK.
 
-That is why events must round-trip unchanged, and it is the reason there is no
-"the outcome is unknown" result. Resolving an uncertain write is the
-implementation's job, because only the implementation knows what it wrote and
-where. A `false` from `try-append!` always means somebody else won.
+Equal event values do not establish ownership: two independent writers can
+produce the same value. A new invocation gets a new ID, so repeating a successful
+append returns `false`, even with the same event. Existing objects without this
+metadata still replay normally and are treated as belonging to another invocation.
+The ID is internal, not a caller-supplied idempotency key for application retries
+or restarts.
 
 ## Replaying
 
