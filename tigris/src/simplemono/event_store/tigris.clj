@@ -2,9 +2,11 @@
   "`simplemono.event-store/EventAppend`, `EventSource` and `EventHead` on
    Tigris.
 
-   One store is one stream, under one prefix in one bucket:
+   One store is one stream, under one prefix in one bucket, and may hold
+   plain values under keys of the caller's choosing next to it:
 
      {prefix}/events/{inverted-19d}   one Nippy object per event
+     {prefix}/{key}                   one Nippy object per keyed value
 
    Event numbers are zero-based and gap-free. `try-append!` is create-only: it
    returns true when the event was written and false when another writer
@@ -60,6 +62,13 @@
    19 digits), so the newest object sorts first and the head is one LIST with
    maxKeys=1.
 
+   Keyed values are the second thing a store holds. `put-value!` and `values`
+   store and read plain data by key with the same codec, create-only put,
+   retries and batched bundle reads as events, but without numbering, order
+   or a head. They are for a caller whose order lives elsewhere — a database
+   transaction that records the key once the put has returned true — and who
+   would otherwise read the values back one request at a time.
+
    This targets Tigris rather than S3 in general: the endpoint and the bundle
    API are theirs, and X-Tigris-Consistent is sent by default so that a replay
    sees events another machine wrote a moment ago."
@@ -69,7 +78,8 @@
             [simplemono.event-store.util :as util]
             [simplemono.event-store.tigris.bundle :as bundle]
             [simplemono.event-store.tigris.codec :as codec])
-  (:import (java.io InterruptedIOException)
+  (:import (clojure.lang MapEntry)
+           (java.io InterruptedIOException)
            (java.net SocketTimeoutException URI)
            (java.net.http HttpClient HttpTimeoutException)
            (java.nio.channels ClosedByInterruptException)
@@ -374,10 +384,11 @@
 
    Entry names are checked against the keys, because a gap-free stream cannot
    legitimately skip one and a replay that quietly dropped an event would be
-   far worse than one that stopped. Stream, decode and reducer exceptions are
-   propagated without retry, with the stream closed and prior reducer effects
-   left intact."
-  [store keys f init]
+   far worse than one that stopped. `missing` names the error that check
+   throws with, since events and keyed values fail in their own words. Stream,
+   decode and reducer exceptions are propagated without retry, with the stream
+   closed and prior reducer effects left intact."
+  [store keys missing f init]
   ;; Only getting hold of the archive is retried. Once entries start reaching
   ;; `f` a retry would hand it the same events twice, so a failure mid-stream
   ;; propagates and the caller resumes from whatever cursor it committed.
@@ -391,7 +402,7 @@
          (let [expected (nth keys read nil)]
            (when-not (= expected name)
              (throw (ex-info "Bundle returned an unexpected object"
-                             {:error :missing-event
+                             {:error missing
                               :expected expected
                               :got name})))
            (let [acc (f acc (codec/decode content))
@@ -413,30 +424,37 @@
   [store]
   (update store :headers dissoc (key (first consistent-header))))
 
-(defn- fetch-batch
-  "Read a batch whose keys the head has promised exist. A short relaxed read
-   is checked with the leader; a short consistent read throws unless `f`
-   stopped early. This also applies to a batch containing just one key.
+(defn- read-promised
+  "Read keys the caller knows to exist. A short relaxed read is followed up
+   with the leader; a batch containing just one key is asked of the leader
+   straight away. Returns {:acc :read :stopped?} without judging a result that
+   is still short: `fetch-batch` and `values` do that, each in its own words.
 
    Only the missing suffix is read again, carrying on from the accumulator
-   already produced. Re-reading the whole batch would hand `f` the same events
+   already produced. Re-reading the whole batch would hand `f` the same objects
    twice, and discarding the accumulator would not undo side effects or the
-   transients used by `into` and `transduce`.
+   transients used by `into` and `transduce`."
+  [store keys missing f init]
+  (let [single? (= 1 (count keys))
+        first-read (if single? (consistent store) (relaxed store))
+        {:keys [acc read stopped?] :as cheap} (reduce-bundle first-read keys missing f init)]
+    (if (or stopped? (= read (count keys)) single?)
+      ;; A singleton has already been asked of the leader.
+      cheap
+      (let [rest-keys (vec (drop read keys))
+            {:keys [acc read stopped?]} (reduce-bundle (consistent store) rest-keys missing f acc)]
+        {:acc acc
+         :read (+ (long (:read cheap)) (long read))
+         :stopped? stopped?}))))
+
+(defn- fetch-batch
+  "Read a batch whose keys the head has promised exist. A short consistent
+   read throws unless `f` stopped early.
 
    End probes are separate: `replay` calls `reduce-bundle` directly for a key
    not yet promised by the head, where an empty answer is legitimate."
   [store keys f init]
-  (let [single? (= 1 (count keys))
-        first-read (if single? (consistent store) (relaxed store))
-        {:keys [acc read stopped?] :as cheap} (reduce-bundle first-read keys f init)
-        result (if (or stopped? (= read (count keys)) single?)
-                 ;; A singleton has already been asked of the leader.
-                 cheap
-                 (let [rest-keys (vec (drop read keys))
-                       {:keys [acc read stopped?]} (reduce-bundle (consistent store) rest-keys f acc)]
-                   {:acc acc
-                    :read (+ (long (:read cheap)) (long read))
-                    :stopped? stopped?}))]
+  (let [result (read-promised store keys :missing-event f init)]
     (when-not (or (:stopped? result) (= (:read result) (count keys)))
       (throw (ex-info "The stream is missing events the head promised"
                       {:error :missing-event
@@ -491,7 +509,7 @@
       (or (nil? latest)
           (> event-number (long latest)))
       (let [{:keys [acc read stopped?]}
-            (reduce-bundle (consistent store) [(event-key prefix event-number)] f acc)]
+            (reduce-bundle (consistent store) [(event-key prefix event-number)] :missing-event f acc)]
         (cond
           stopped? @acc
           (or (zero? (long read)) (= event-number Long/MAX_VALUE)) acc
@@ -584,6 +602,89 @@
     :http-client (HttpClient/newHttpClient)
     :bundle-request (or bundle-request bundle/request!)
     :on-retry (or on-retry print-retry)}))
+
+(defn- value-key
+  [prefix key]
+  (let [prefix (normalize-prefix prefix)]
+    (if (str/blank? prefix)
+      key
+      (str prefix "/" key))))
+
+(defn- check-value-key!
+  "A non-blank string that stays out of events/, which the stream owns: the
+   head is one LIST under that segment with maxKeys=1, so a stray object
+   sorting before the newest event would be reported as the head."
+  [key]
+  (when-not (and (string? key)
+                 (not (str/blank? key))
+                 (not (str/starts-with? key "/"))
+                 (not (str/starts-with? key "events/")))
+    (throw (ex-info "Value keys are non-blank strings outside events/"
+                    {:error :incorrect :key key}))))
+
+(defn put-value!
+  "Create-only put of `value` at {prefix}/{key}.
+
+   True when this invocation wrote it, including its retries, and false when
+   the key already existed, even if the stored value is equal. `value` is the
+   same plain data an event may be, validated and frozen before any request.
+   Retries, write ownership on a 412 and cancellation follow `try-append!`,
+   because this is the put behind it: only a normal true/false return
+   guarantees a resolved outcome.
+
+   Values are not events. Nothing here numbers, lists or orders them; that is
+   the caller's business, typically a database transaction that records the
+   key once this has returned true."
+  [{:keys [prefix] :as store} key value]
+  (check-value-key! key)
+  (put! store (value-key prefix key) (codec/encode value)))
+
+(defn values
+  "The values at `keys`, as [key value] entries in the order asked for, as
+   something `reduce` can walk.
+
+   `keys` is a sequence of distinct value keys the caller knows to exist; a
+   stored nil or false is a value like any other. Invalid keys throw
+   {:error :incorrect} here, before any reading begins. Reads go in batches
+   of up to a hundred keys, relaxed first and re-read through the leader when
+   a batch comes back short, exactly as a replay reads the events its head
+   promised. A key still missing after that throws {:error :missing-value}
+   naming the keys that did not arrive, and a hole in the middle of a batch
+   throws as soon as another object arrives in its place. Quietly leaving a
+   value out would corrupt whatever they are being folded into.
+
+   Reducible and deliberately not seqable, for the same reason as `events`: an
+   archive is open while a batch is read, and reducing means it is closed by
+   the time the call returns. `f` may return `reduced` to stop, which also
+   stops requesting further batches. Failures while consuming an open archive,
+   decoding, or in `f` propagate after the archive is closed; entries already
+   handed to `f` are not handed over again."
+  [{:keys [prefix] :as store} keys]
+  (when-not (sequential? keys)
+    (throw (ex-info "Value keys must be a sequence" {:error :incorrect})))
+  (run! check-value-key! keys)
+  (when-not (= (count keys) (count (set keys)))
+    (throw (ex-info "Value keys must be distinct" {:error :incorrect})))
+  (util/reducible
+   (fn [rf init]
+     (loop [batches (partition-all max-batch-size keys)
+            acc init]
+       (if-let [batch (some-> (first batches) vec)]
+         (let [position (volatile! 0)
+               f (fn [acc value]
+                   (let [key (nth batch @position)]
+                     (vswap! position inc)
+                     (rf acc (MapEntry/create key value))))
+               {:keys [acc read stopped?]}
+               (read-promised store (mapv #(value-key prefix %) batch) :missing-value f acc)]
+           (cond
+             stopped? @acc
+             (< (long read) (count batch))
+             (throw (ex-info "Values the caller promised are missing"
+                             {:error :missing-value
+                              :missing (subvec batch read)}))
+             :else (recur (next batches) acc)))
+         acc)))))
 
 (comment
 

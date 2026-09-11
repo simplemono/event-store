@@ -9,7 +9,8 @@
             [simplemono.event-store.tigris.codec-test]
             [simplemono.event-store.tigris.retry-test]
             [simplemono.event-store.tigris.replay-failure-test]
-            [simplemono.event-store.tigris.cancellation-test])
+            [simplemono.event-store.tigris.cancellation-test]
+            [simplemono.event-store.tigris.values-test])
   (:import (software.amazon.awssdk.core ResponseInputStream)
            (software.amazon.awssdk.core.exception SdkClientException)
            (software.amazon.awssdk.core.sync RequestBody)
@@ -590,6 +591,7 @@
                                       'simplemono.event-store.tigris.codec-test
                                       'simplemono.event-store.tigris.retry-test
                                       'simplemono.event-store.tigris.replay-failure-test
-                                      'simplemono.event-store.tigris.cancellation-test)]
+                                      'simplemono.event-store.tigris.cancellation-test
+                                      'simplemono.event-store.tigris.values-test)]
     (when (pos? (+ fail error))
       (System/exit 1))))

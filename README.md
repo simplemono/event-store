@@ -328,6 +328,40 @@ one event.** What this genuinely costs is facts that must be atomic and cannot
 be merged into one event. Those belong in a transactional store, not in this
 log.
 
+## Values by key
+
+A store also holds plain values under keys the caller chooses, next to its
+stream:
+
+```
+{prefix}/{key}   one Nippy object per value
+```
+
+```clojure
+(tigris/put-value! store "0199…-squuid" {:event/type :invoice/paid :amount 12.5M})
+;; => true, or false when the key already existed
+
+(into {} (tigris/values store ["0199…" "019a…"]))
+;; => {"0199…" {…}, "019a…" {…}}
+```
+
+`put-value!` is the create-only put behind `try-append!` without the
+numbering: the same codec, the same retries, the same write-ownership check on
+a 412, and the same rule that only a normal true/false return settles the
+outcome. `values` is the batched bundle read behind `events` without the head:
+keys the caller knows to exist, up to a hundred per request, relaxed first with
+a short remainder re-read through the leader, returning `[key value]` entries
+in the order asked for as something `reduce` can walk. A key still missing
+after the leader has been asked throws `{:error :missing-value}` naming the
+keys that did not arrive; a hole in the middle of a batch throws as soon as
+another object arrives in its place. Invalid keys throw `{:error :incorrect}`
+when `values` is called, before any reading begins.
+
+Values have no order, number or head. They exist for a caller whose order
+lives elsewhere — a database transaction that records the key once the put has
+returned true — and who would otherwise read them back one request at a time.
+Keys are non-blank strings outside `events/`, which the stream owns.
+
 ## Options
 
 `tigris/store` requires `:bucket` and `:prefix`, plus credentials unless the
